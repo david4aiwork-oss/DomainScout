@@ -1,7 +1,8 @@
 # Phase 1 — Skeleton: design
 
-**Status:** ✅ **APPROVED 2026-07-14** (owner final approval, review round 2). Three trivia items folded in below
+**Status:** ✅ **BUILT 2026-07-14** (owner final approval, review round 2). Three trivia items folded in below
 (`[ingestion]` config table, `dismissed` reachability via `outcome --dismiss`, `.env.example` Dynadot placeholder).
+Implemented per docs/superpowers/plans/2026-07-14-phase-1-skeleton.md.
 Next: writing-plans → Phase-1 implementation plan → build.
 **Parent:** [`docs/TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md) (the TDD is the design spec; this is the Phase-1 slice).
 

@@ -70,7 +70,7 @@ Identity = surrogate `id` PK + partial unique index `UNIQUE(domain) WHERE lifecy
 
 ## Current Status
 
-- [ ] Phase 1: skeleton
+- [x] Phase 1: skeleton
 - [ ] Phase 2: ingestion (free sources: WhoisFreaks free feed + Dynadot expired-auction CSV)
 - [ ] Phase 3: rules filter
 - [ ] Phase 4: RDAP verification
