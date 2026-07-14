@@ -32,3 +32,8 @@ max_requests_per_sec = 1.0        # polite default; Verisign publishes no numeri
 
 [retention]
 days = 360                        # raw feeds + digests pruned after this; DB is permanent
+
+[sources.whoisfreaks]             # feed location (confirmed against the live repo 2026-07-14)
+base_url = "https://raw.githubusercontent.com/WhoisFreaks/daily-expired-and-dropped-domains/main"
+expired_filename = "{date}-free-expired-domains.csv"   # {date} -> YYYY-MM-DD
+dropped_filename = "{date}-free-dropped-domains.csv"

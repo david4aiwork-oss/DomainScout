@@ -39,6 +39,13 @@ max_requests_per_sec = 1.0
 days = 360
 """
 
+WF_SECTION = """
+[sources.whoisfreaks]
+base_url = "https://raw.githubusercontent.com/WhoisFreaks/daily-expired-and-dropped-domains/main"
+expired_filename = "{date}-free-expired-domains.csv"
+dropped_filename = "{date}-free-dropped-domains.csv"
+"""
+
 
 def _write(tmp_path, text):
     p = tmp_path / "criteria.toml"
@@ -81,8 +88,31 @@ def test_invalid_charset_regex_rejected(tmp_path):
         load_criteria(_write(tmp_path, bad))
 
 
+def test_whoisfreaks_config_absent_is_none(tmp_path):
+    crit = load_criteria(_write(tmp_path, VALID_TOML))
+    assert crit.whoisfreaks is None
+
+
+def test_whoisfreaks_config_loads(tmp_path):
+    crit = load_criteria(_write(tmp_path, VALID_TOML + WF_SECTION))
+    assert crit.whoisfreaks is not None
+    assert crit.whoisfreaks.base_url.endswith("/main")
+    assert crit.whoisfreaks.expired_filename == "{date}-free-expired-domains.csv"
+    assert crit.whoisfreaks.dropped_filename == "{date}-free-dropped-domains.csv"
+
+
+def test_whoisfreaks_missing_key_raises(tmp_path):
+    bad = VALID_TOML + WF_SECTION.replace(
+        'expired_filename = "{date}-free-expired-domains.csv"\n', ""
+    )
+    with pytest.raises(ConfigError, match="expired_filename"):
+        load_criteria(_write(tmp_path, bad))
+
+
 def test_repo_criteria_toml_is_valid():
     # Guards against the shipped config drifting out of sync with the loader.
     crit = load_criteria(REPO_ROOT / "criteria.toml")
     assert crit.tld == "com"
     assert crit.ingest_max_length == max(crit.primary_max_length, crit.secondary_max_length)
+    assert crit.whoisfreaks is not None
+    assert "WhoisFreaks/daily-expired-and-dropped-domains" in crit.whoisfreaks.base_url

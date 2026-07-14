@@ -14,6 +14,13 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class WhoisFreaksConfig:
+    base_url: str
+    expired_filename: str  # template containing "{date}"
+    dropped_filename: str  # template containing "{date}"
+
+
+@dataclass(frozen=True)
 class Criteria:
     tld: str
     charset: str
@@ -30,6 +37,7 @@ class Criteria:
     rdap_endpoint: str
     rdap_max_rps: float
     retention_days: int
+    whoisfreaks: WhoisFreaksConfig | None = None
 
     @property
     def ingest_max_length(self) -> int:
@@ -84,6 +92,23 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
     if not isinstance(sources, list) or not all(isinstance(s, str) for s in sources):
         raise ConfigError("criteria.toml: [ingestion].sources must be a list of strings")
 
+    whoisfreaks = None
+    sources_tbl = data.get("sources")
+    if isinstance(sources_tbl, dict) and "whoisfreaks" in sources_tbl:
+        wf = sources_tbl["whoisfreaks"]
+        if not isinstance(wf, dict):
+            raise ConfigError("criteria.toml: [sources.whoisfreaks] must be a table")
+        for key in ("base_url", "expired_filename", "dropped_filename"):
+            if key not in wf:
+                raise ConfigError(
+                    f"criteria.toml: missing '{key}' in [sources.whoisfreaks]"
+                )
+        whoisfreaks = WhoisFreaksConfig(
+            base_url=str(wf["base_url"]),
+            expired_filename=str(wf["expired_filename"]),
+            dropped_filename=str(wf["dropped_filename"]),
+        )
+
     return Criteria(
         tld=tld,
         charset=charset,
@@ -100,4 +125,5 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
         rdap_endpoint=str(_require(data, "rdap", "endpoint")),
         rdap_max_rps=_as_float(_require(data, "rdap", "max_requests_per_sec"), "[rdap].max_requests_per_sec"),
         retention_days=_as_int(_require(data, "retention", "days"), "[retention].days"),
+        whoisfreaks=whoisfreaks,
     )
