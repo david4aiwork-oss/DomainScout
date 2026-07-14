@@ -126,3 +126,80 @@ def test_ingest_file_dry_run_writes_nothing(tmp_path):
     assert counts.landed == 6  # still tallied
     assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM ingest_log").fetchone()[0] == 0
+
+
+def test_infer_feed_category():
+    assert ingest.infer_feed_category("2026-07-13-free-expired-domains.csv") == "expired"
+    assert ingest.infer_feed_category("2026-07-13-free-dropped-domains.csv") == "dropped"
+    assert ingest.infer_feed_category("mystery.csv") is None
+
+
+def test_build_source_unknown_raises():
+    with pytest.raises(ValueError, match="unknown source"):
+        ingest.build_source("nope", CRIT)
+
+
+def test_ingest_source_downloads_and_ingests_both_files(tmp_path):
+    conn = _conn(tmp_path)
+    body = FIXTURE.read_bytes()
+    client = _client(lambda req: httpx.Response(200, content=body))
+    results = ingest.ingest_source(
+        conn, _source(), date(2026, 7, 13), CRIT, tmp_path / "feeds", client)
+    assert [c.feed_file for c in results] == [
+        "2026-07-13-free-expired-domains.csv",
+        "2026-07-13-free-dropped-domains.csv",
+    ]
+    # both files carry the same fixture -> same 6 domains collapse to 6 open rows
+    assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 6
+    assert conn.execute("SELECT COUNT(*) FROM ingest_log").fetchone()[0] == 2
+
+
+def test_ingest_source_skips_404(tmp_path):
+    conn = _conn(tmp_path)
+    client = _client(lambda req: httpx.Response(404))
+    results = ingest.ingest_source(
+        conn, _source(), date(2026, 7, 13), CRIT, tmp_path / "feeds", client)
+    assert results == []  # both 404 -> skipped, no crash
+    assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0
+
+
+def test_ingest_local_file_infers_category(tmp_path):
+    conn = _conn(tmp_path)
+    named = tmp_path / "2026-07-13-free-dropped-domains.csv"
+    named.write_bytes(FIXTURE.read_bytes())
+    counts = ingest.ingest_local_file(
+        conn, path=named, criteria=CRIT, run_date=date(2026, 7, 13))
+    assert counts.landed == 6
+    row = conn.execute(
+        "SELECT feed_category FROM candidates WHERE domain='apple.com'").fetchone()
+    assert row["feed_category"] == "dropped"
+
+
+def test_ingest_local_file_unknown_category_raises(tmp_path):
+    conn = _conn(tmp_path)
+    mystery = tmp_path / "mystery.csv"
+    mystery.write_bytes(FIXTURE.read_bytes())
+    with pytest.raises(ValueError, match="feed.category"):
+        ingest.ingest_local_file(
+            conn, path=mystery, criteria=CRIT, run_date=date(2026, 7, 13))
+
+
+def test_run_ingest_skips_dynadot_stub_with_notice(tmp_path, capsys):
+    conn = _conn(tmp_path)
+    body = FIXTURE.read_bytes()
+    client = _client(lambda req: httpx.Response(200, content=body))
+    results = ingest.run_ingest(
+        conn, criteria=CRIT, run_date=date(2026, 7, 13),
+        source_names=["whoisfreaks", "dynadot"], feeds_dir=tmp_path / "feeds",
+        client=client)
+    out = capsys.readouterr().out.lower()
+    assert "dynadot" in out and "phase 2b" in out
+    assert len(results) == 2  # only whoisfreaks' two files
+
+
+def test_summary_line_mentions_landed():
+    from domainscout.models import IngestCounts
+    line = ingest.summary_line(IngestCounts(
+        source="whoisfreaks", feed_file="f.csv", seen=12,
+        rejected_tld=2, rejected_charset=3, rejected_length=1, landed=6))
+    assert "landed=6" in line and "whoisfreaks" in line

@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
@@ -15,8 +16,15 @@ from domainscout import db
 from domainscout.config import Criteria
 from domainscout.models import Candidate, IngestCounts
 from domainscout.sources.base import FeedFile, FeedSource
+from domainscout.sources.dynadot import DynadotSource
+from domainscout.sources.whoisfreaks import WhoisFreaksSource
 
 DEFAULT_FEEDS_DIR = "data/feeds"
+
+SOURCE_FACTORIES: "dict[str, Callable[[Criteria], FeedSource]]" = {
+    "whoisfreaks": WhoisFreaksSource.from_criteria,
+    "dynadot": DynadotSource.from_criteria,
+}
 
 
 def gate(domain: str, criteria: Criteria) -> tuple[bool, str | None]:
@@ -81,3 +89,118 @@ def ingest_file(
     if not dry_run:
         db.record_ingest(conn, counts)
     return counts
+
+
+def build_source(name: str, criteria: Criteria) -> FeedSource:
+    try:
+        factory = SOURCE_FACTORIES[name]
+    except KeyError:
+        raise ValueError(f"unknown source: {name!r}") from None
+    return factory(criteria)
+
+
+def infer_feed_category(filename: str) -> str | None:
+    low = filename.lower()
+    if "expired" in low:
+        return "expired"
+    if "dropped" in low:
+        return "dropped"
+    return None
+
+
+def ingest_source(
+    conn,
+    source: FeedSource,
+    run_date: date,
+    criteria: Criteria,
+    feeds_dir: str | Path,
+    client: httpx.Client,
+    *,
+    dry_run: bool = False,
+) -> list[IngestCounts]:
+    """Download + ingest each of the source's feed files. A file that is not
+    published yet (404 during the ~1-day lag) is a warning + skip, not a crash."""
+    results: list[IngestCounts] = []
+    for feed_file in source.feed_files(run_date):
+        try:
+            path = download(feed_file, feeds_dir, client)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                print(f"warning: {feed_file.remote_url} not published yet (404) — skipping")
+                continue
+            raise
+        results.append(
+            ingest_file(
+                conn,
+                source,
+                path=path,
+                feed_category=feed_file.feed_category,
+                feed_file_name=feed_file.local_name,
+                run_date=run_date,
+                criteria=criteria,
+                dry_run=dry_run,
+            )
+        )
+    return results
+
+
+def ingest_local_file(
+    conn,
+    *,
+    path: str | Path,
+    criteria: Criteria,
+    run_date: date,
+    source_name: str = "whoisfreaks",
+    feed_category: str | None = None,
+    dry_run: bool = False,
+) -> IngestCounts:
+    """Ingest a LOCAL feed file (offline/TDD + re-ingest-from-retained path)."""
+    source = build_source(source_name, criteria)
+    category = feed_category or infer_feed_category(Path(path).name)
+    if category is None:
+        raise ValueError(
+            f"cannot infer feed_category from {Path(path).name!r}; pass --feed-category"
+        )
+    return ingest_file(
+        conn,
+        source,
+        path=Path(path),
+        feed_category=category,
+        feed_file_name=Path(path).name,
+        run_date=run_date,
+        criteria=criteria,
+        dry_run=dry_run,
+    )
+
+
+def run_ingest(
+    conn,
+    *,
+    criteria: Criteria,
+    run_date: date,
+    source_names: "list[str]",
+    feeds_dir: str | Path,
+    client: httpx.Client,
+    dry_run: bool = False,
+) -> list[IngestCounts]:
+    """Ingest every requested source. Not-yet-implemented sources (the Dynadot
+    stub, which raises NotImplementedError) are skipped with a notice."""
+    results: list[IngestCounts] = []
+    for name in source_names:
+        source = build_source(name, criteria)
+        try:
+            results.extend(
+                ingest_source(conn, source, run_date, criteria, feeds_dir, client,
+                              dry_run=dry_run)
+            )
+        except NotImplementedError as exc:
+            print(f"skipping source {name!r}: {exc}")
+    return results
+
+
+def summary_line(counts: IngestCounts) -> str:
+    return (
+        f"{counts.source} {counts.feed_file}: seen={counts.seen} "
+        f"tld={counts.rejected_tld} charset={counts.rejected_charset} "
+        f"length={counts.rejected_length} landed={counts.landed}"
+    )
