@@ -175,11 +175,11 @@ Target: ~50–200 survivors/day → Phase 4.
 - **Provider-agnostic** `score(domain, context) → JSON`; default Anthropic (Haiku triage → Sonnet deep, Batch API).
 - **Hybrid local/AI split:** deterministic dims (length, lifecycle, dict/pronounceability from Phase 3) computed locally and passed as **context**; only subjective dims (brandability, memorability, commercial potential, linguistic clarity) are AI-scored.
 - **Comps grounding ($0 path):**
-  - **NameBio free API** — real aggregated comparable-sale stats: `RetailStats` (count/avg/max/σ per keyword & placement) + `TLDStats`, both downloadable as **CSV → local cache** (`namebio_comps.csv`), refreshed periodically. **Free, attribution required** (cite NameBio in the digest). *(This likely retires `DECISIONS.md` pending proposal #3's $10/mo plan — see [§7](#7-decisions--open-items).)* ⚠️ Do **not** use NameBio's *paid* API — its ToS forbids use in any product/service without written permission.
+  - **NameBio free API** — real aggregated comparable-sale stats: `RetailStats` (count/avg/max/σ per keyword & placement) + `TLDStats`, both downloadable as **CSV → local cache** (`namebio_comps.csv`), refreshed periodically. **Keep these CSVs permanently** — aggregated stats age slowly, so a cached snapshot stays a usable comps reference even if NameBio changes or goes away (fuller hedge in [§9](#9-future-enhancements)). **Free, attribution required** (cite NameBio in the digest). *(This likely retires `DECISIONS.md` pending proposal #3's $10/mo plan — see [§7](#7-decisions--open-items).)* ⚠️ Do **not** use NameBio's *paid* API — its ToS forbids use in any product/service without written permission.
   - **HumbleWorth** — open-source valuation model **self-hosted via Docker/Cog** (free, CPU, ~2 GB RAM), returning an `auction/marketplace/brokerage` triple = a modeled low/mid/high range. (Hosted Replicate API ~$0.10/1k is the fallback.) ⚠️ A *model estimate*, trained through early-2024 — pair with NameBio's real stats, don't rely on it alone.
   - **Injection:** NameBio real stats (reality band) + HumbleWorth modeled triple (point anchor) → the LLM reconciles into a value range + rationale.
 - **Weights are data-calibrated**, not hand-set — tune against Phase 6 outcomes (arXiv Rank-SVM is the template).
-- **Toxicity gate before scoring** (`toxicity.py`): Wayback CDX history *shape* + Google Safe Browsing (both free), following domainhunter's *multi-source reputation* pattern (re-pick live sources).
+- **Toxicity gate before scoring** (`toxicity.py`): Wayback CDX history *shape* + Google Safe Browsing (both free), following domainhunter's *multi-source reputation* pattern (re-pick live sources). History shape, domain age, and our own prior-drop count also feed a **drop-reason / quality inference** ([§9](#9-future-enhancements)).
 
 ### 4.6 Phases 6–7 — Outcomes & digest
 
@@ -248,6 +248,21 @@ calibration signal ("liked it, wasn't available"), and exclude it from active ra
 `drop_date_actual` when known, else `drop_date_est`. `verified_at`/`scored_at` let each phase skip
 already-processed rows while re-runs stay safe (upsert converges).
 
+**Multiple drops over time (owner's f1).** The open-cycle index allows **one open row per domain but
+unlimited closed rows**, so a domain that drops, gets re-registered, and later drops again is modeled as
+**distinct cycle rows**:
+
+| id | domain | lifecycle_status | first_seen | drop_date_actual | note |
+|----|--------|------------------|-----------|------------------|------|
+| 1 | foo.com | dropped | 2026-07-01 | 2026-08-20 | cycle 1: dropped, someone else grabbed it |
+| 2 | foo.com | expiring | 2028-06-05 | (null) | cycle 2: new owner lapsed → fresh open opportunity |
+
+Ingestion upserts into the *open* row if one exists
+(`INSERT ... ON CONFLICT(domain) WHERE lifecycle_status NOT IN ('dropped','renewed','reregistered') DO UPDATE`);
+if every prior row is closed, it inserts a new cycle. A drop or renewal closes the current row; a later
+feed reappearance opens the next — full re-registration history, no moving-key bug. A domain's **prior-drop
+count** (rows where `lifecycle_status='dropped'`) is itself a quality signal (see [§9](#9-future-enhancements)).
+
 ---
 
 ## 6. Anti-patterns we're designing around
@@ -306,7 +321,31 @@ Stdlib-first keeps the Windows-local → VPS move trivial.
 
 ---
 
-## 9. Sources & evidence
+## 9. Future enhancements
+
+Deferred by design — captured so they aren't lost. None block Phases 1–8.
+
+- **HumbleWorth self-hosted on the VPS** *(owner request, f4).* On Windows-local, use HumbleWorth's free
+  hosted endpoint (or Replicate ~$0.10/1k) — no model to run locally. Once on the cheap VPS (ratified
+  infra plan), **self-host the open-source model via Docker/Cog** for free, unlimited, offline valuations.
+  Later, optionally **fork/improve the model** — retrain past its early-2024 data cutoff, or fine-tune on
+  our own accumulated Phase-6 outcomes.
+- **Own independent comps dataset (NameBio hedge)** *(f3).* Beyond caching the free NameBio CSVs
+  permanently ([§4.5](#45-phase-5--two-tier-ai-scoring)), accumulate our OWN comps from (a) the **Phase-6
+  outcomes tracker** — every tracked domain's real auction/sale price becomes an owned data point — and
+  (b) optional ingestion of **free public sale reports** (e.g. DNJournal weekly sales, NameBio free
+  daily-sales) into a local `comps` table. Won't rival NameBio's 6.9M records quickly, but it's owned,
+  growing, and free — insurance against NameBio changing terms.
+- **Drop-reason inference** *(f2).* The registry never records *why* a domain drops, but likely reason can
+  be inferred from a signal bundle and used as a quality signal: Wayback history *shape* (real business
+  gone dark = higher quality; never-developed park = speculative churn; content-flip = toxic), domain age /
+  registration history (RDAP `registration_date`), pre-drop DNS/MX (real mail+web vs. parked), backlinks
+  (if a free API exists), and — uniquely ours — the **prior-drop count from our own DB history** (a serial
+  dropper that has dropped repeatedly is usually low quality). Feed it into the Tier-2 quality/toxicity context.
+
+---
+
+## 10. Sources & evidence
 
 Survey run `wf_dd773f78-442` (23/23 claims 3-0) + second pass (primary sources below).
 
