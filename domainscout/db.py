@@ -82,3 +82,59 @@ def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def upsert_candidate(conn: sqlite3.Connection, candidate: Candidate) -> int:
+    """Insert a new open cycle for candidate.domain, or update the existing open
+    row. Returns the row id. Refreshes source/feed_category only — lifecycle_status
+    (RDAP owns it post-ingestion) and first_seen (insert-only) are never touched."""
+    first_seen = candidate.first_seen or datetime.now()
+    if isinstance(first_seen, datetime):
+        first_seen = first_seen.isoformat(timespec="seconds")
+    cur = conn.execute(
+        f"""
+        INSERT INTO candidates (domain, source, feed_category, first_seen, lifecycle_status)
+        VALUES (:domain, :source, :feed_category, :first_seen, :lifecycle_status)
+        ON CONFLICT(domain) WHERE {_OPEN_PREDICATE}
+        DO UPDATE SET
+            source = excluded.source,
+            feed_category = excluded.feed_category
+        RETURNING id
+        """,
+        {
+            "domain": candidate.domain,
+            "source": candidate.source,
+            "feed_category": candidate.feed_category,
+            "first_seen": first_seen,
+            "lifecycle_status": candidate.lifecycle_status,
+        },
+    )
+    row_id = cur.fetchone()[0]
+    conn.commit()
+    return row_id
+
+
+def record_ingest(conn: sqlite3.Connection, counts: IngestCounts) -> None:
+    """Upsert one ingest_log row, keyed (run_date, source, feed_file). Re-running
+    a day's file recomputes and overwrites the counts (idempotent)."""
+    run_date = counts.run_date or date.today()
+    if isinstance(run_date, date):
+        run_date = run_date.isoformat()
+    conn.execute(
+        """
+        INSERT INTO ingest_log
+            (run_date, source, feed_file, seen, rejected_tld, rejected_charset, rejected_length, landed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_date, source, feed_file) DO UPDATE SET
+            seen = excluded.seen,
+            rejected_tld = excluded.rejected_tld,
+            rejected_charset = excluded.rejected_charset,
+            rejected_length = excluded.rejected_length,
+            landed = excluded.landed
+        """,
+        (
+            run_date, counts.source, counts.feed_file, counts.seen,
+            counts.rejected_tld, counts.rejected_charset, counts.rejected_length, counts.landed,
+        ),
+    )
+    conn.commit()
