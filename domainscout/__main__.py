@@ -9,7 +9,6 @@ from domainscout import __version__, commands
 from domainscout.db import DEFAULT_DB_PATH
 
 _STUB_HELP = {
-    "ingest": "[Phase 2] pull daily feeds, apply the .com+charset+length gate, upsert candidates",
     "filter": "[Phase 3] deterministic rules filter (dictionary + pronounceability)",
     "verify": "[Phase 4] RDAP verification and status-driven drop dates",
     "score-submit": "[Phase 5] submit the AI scoring batch",
@@ -29,6 +28,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init-db", help="create the database schema (idempotent)")
     p_init.set_defaults(func=commands.cmd_init_db)
+
+    p_ingest = sub.add_parser(
+        "ingest",
+        help="[Phase 2] pull daily feeds, apply the .com+charset+length gate, upsert candidates",
+    )
+    p_ingest.add_argument("--source", action="append",
+                          help="source name (repeatable; default: criteria.sources)")
+    p_ingest.add_argument("--date", help="feed date YYYY-MM-DD (default: yesterday)")
+    p_ingest.add_argument("--file", help="ingest a LOCAL feed file instead of downloading")
+    p_ingest.add_argument("--feed-category", choices=["expired", "dropped"],
+                          dest="feed_category",
+                          help="feed_category for --file when the name is ambiguous")
+    p_ingest.add_argument("--criteria", default="criteria.toml",
+                          help="path to criteria.toml (default: criteria.toml)")
+    p_ingest.add_argument("--dry-run", action="store_true",
+                          help="gate + print counts, write nothing")
+    p_ingest.set_defaults(func=commands.cmd_ingest)
 
     # outcome carries the dismissal-intent note now; the --dismiss flag lands in Phase 6.
     p_outcome = sub.add_parser(
