@@ -1,0 +1,34 @@
+# DomainScout criteria — tunable config. See docs/TECHNICAL-DESIGN.md.
+
+[ingestion]                       # the hard-invariant gate (TDD §4.2), applied on the way in
+tld = "com"                       # .com only, ever
+charset = "^[a-z]+$"              # no hyphens/numbers; shared by both tracks
+sources = ["whoisfreaks", "dynadot"]
+schedule_hint = "late-morning"    # WhoisFreaks feed has ~1-day lag; don't race the upload
+# NOTE: the ingestion length ceiling is DERIVED in code = max(primary.max_length,
+# secondary.max_length). Do NOT add a separate value here — one source of truth.
+
+[primary]                         # <=8-char dictionary .com
+max_length = 8
+max_words = 2
+
+[secondary]                       # 9-12-char invented / geo+service
+min_length = 9
+max_length = 12                   # widest target => also the derived ingestion ceiling
+
+[dictionary]
+zipf_min = 3.0                    # wordfreq zipf_frequency threshold (tunable)
+
+[pronounceability]
+min_score = 0.02                  # n-gram floor (tunable; calibrate against outcomes later)
+
+[scoring]
+tier2_cutoff = 30                 # deep-score top N
+digest_top_n = 10                 # digest shows top N
+
+[rdap]
+endpoint = "https://rdap.verisign.com/com/v1/"
+max_requests_per_sec = 1.0        # polite default; Verisign publishes no numeric limit
+
+[retention]
+days = 360                        # raw feeds + digests pruned after this; DB is permanent
