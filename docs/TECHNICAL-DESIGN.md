@@ -152,7 +152,9 @@ tests/
   are permanent invariants of the owner criteria, not tunable thresholds — so apply them *at ingestion* and land **only
   survivors** in `candidates`. This keeps the permanent DB from filling with ~99% junk (~1.8M charset/length failures/year).
   Order: strip non-`.com` → `^[a-z]+$` → length ≤ 12. *(The length ceiling tracks `secondary.max_length` (12), **not** primary
-  (8) — gating at 8 would discard every secondary-target candidate.)*
+  (8) — gating at 8 would discard every secondary-target candidate.)* Gate config lives in `criteria.toml`
+  `[ingestion]` (`tld`, `charset`, `sources`); the length ceiling is **derived in code** = `max(primary, secondary).max_length`
+  so there's no duplicated `12` to drift.
 - **Nothing is lost by gating early:** raw feed files are retained 360 days ([§4.7](#47-phase-8--local-review-ui)), so if the
   criteria are ever loosened we **re-ingest from the retained feeds**. Dictionary & pronounceability stay in Phase 3 because
   *those* thresholds are tunable.
@@ -208,7 +210,7 @@ Target: ~50–200 survivors/day → Phase 4.
 
 ### 4.6 Phases 6–7 — Outcomes & digest
 
-- **Outcomes** (`outcomes.py`): writes `outcome`/`outcome_price`/`outcome_date` back → calibration input.
+- **Outcomes** (`outcomes.py`): writes `outcome`/`outcome_price`/`outcome_date` back → calibration input. Also the pre-Phase-8 manual **dismissal** path — `outcome <domain> --dismiss` sets `lifecycle_status='dismissed'` (closes the cycle) so that terminal state is reachable from the CLI before the UI exists (the Phase-1 stub's help text records this intent).
 - **Digest** (`digest.py`): local markdown, top ~10, ranked with score + rationale + drop date + action (register/backorder/bid/skip). Digests retained per [§4.7](#47-phase-8--local-review-ui) retention.
 
 ### 4.7 Phase 8 — Local review UI
