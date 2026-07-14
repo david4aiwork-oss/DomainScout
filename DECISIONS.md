@@ -31,6 +31,24 @@ Ratified after the technical-design survey + a second research pass (see docs/TE
 - **UI + retention:** add **Phase 8** — a local **Flask/FastAPI** app to view/filter the DB + Phase 6/7 results with write-back. Keep raw feed files + digests **360 days** then auto-prune; the SQLite DB is permanent.
 - **Licenses verified:** whoisit (BSD-3), whodap (MIT), domainhunter (BSD-3), spidy (MIT) clean; domainsearcher-app & Williams-Media claim MIT but ship no LICENSE file (patterns-only); domain-watchdog is AGPL (study only); the WhoisFreaks free feed has no stated data-use terms (fine for personal use; clarify before commercial).
 
+### 2026-07-14 — Review round 2: ratifications, schema amendment, FastAPI
+Owner reviewed the TDD a second time, ratified the three open items, and raised three concerns + smaller notes — all folded into the TDD (see its v2→v2.1 changelog).
+
+**Ratified:**
+- **3.1 Data-source model** — WhoisFreaks free feed (name firehose → hand-register/backorder) + Dynadot public expired-*auction* CSV (→ bid branch). Personal use only pending WhoisFreaks license clarification; revisit before any commercial use.
+- **3.2 Comps $0 path** — NameBio free RetailStats/TLDStats (cached CSV, attribution in digest) + HumbleWorth open-source model (hosted endpoint on Windows-local; self-host via Docker on VPS later). Retires proposal #3 (paid NameBio API ToS forbids pipeline use). **CONDITION:** a ~30-min empirical spike against the NameBio free endpoint (~20 keywords, confirm limits + CSV path) precedes Phase-5 prompt design; if it underdelivers, promote the own-comps-table hedge (TDD §9) to a Phase-5 component.
+- **3.3 Open-cycle schema — amended** (fixes a real bug the owner caught): `'dropped'` is an **OPEN** state — a dropped-and-available domain is the live hand-register opportunity, so treating it as closed both (a) births every dropped-feed row outside the unique index → daily duplicate rows (`ON CONFLICT` never fires), and (b) models the most actionable candidates as history the moment they arrive. Cycles close only on `reregistered` (RDAP-confirmed 200 after a real drop), `renewed`, or owner `dismissed`. Index predicate → `NOT IN ('renewed','reregistered','dismissed')`; `lifecycle_status NOT NULL DEFAULT 'unknown'` (a NULL escapes the partial index). Ingestion sets `feed_category` from the filename, **not** `lifecycle_status`. Implies Phase 4 **re-verifies** open `dropped` rows (not verify-once) — the RDAP 200 is what flips `dropped → reregistered`.
+- **Phase 8 UI = FastAPI + uvicorn** — async-native (matches the aiohttp/httpx stack) + auto API docs. (Was "Flask/FastAPI".)
+- **HumbleWorth on Windows-local:** use the hosted endpoint; defer self-hosting to the VPS phase.
+
+**Design refinements folded in (owner's smaller notes):**
+- **Charset+length gate moves to ingestion** — permanent invariants, not tunable thresholds; only survivors land in the permanent DB (avoids ~1.8M junk rows/yr). Length ceiling = **secondary max (12), not primary (8)** (else all secondary candidates would be discarded). Per-run counts logged to a new `ingest_log` table. Dictionary/pronounceability stay in Phase 3 (tunable). Re-ingest from the 360-day retained feeds if criteria loosen.
+- **`score` split into `score-submit` / `score-collect`** — Batch API is async (hours); a submit-and-wait cron step would hang and break idempotency.
+- **Toxicity gate runs between Tier-1 and Tier-2** (on Tier-1 survivors), not on all filter survivors — keeps slow CDX/Safe-Browsing calls off the critical path.
+- **Cron timing:** late-morning run (feed has ~1-day lag) so ingestion never races the WhoisFreaks upload.
+- **`wordfreq` is frozen at 2024** (author stopped updating; LLM-corpus pollution) — emerging vocab won't register; that's the Tier-2 Google-Trends context's job, not the Phase-3 dictionary gate's.
+- **Google Safe Browsing** needs a free-tier Google Cloud API key → added to the credentials/`.env` signup list.
+
 ### Accepted defaults (owner didn't object; cheap to change)
 - Daily digest: **local markdown file**, top **10** candidates, Tier-2 scoring cutoff ~**30** domains.
 
@@ -46,7 +64,7 @@ Ratified after the technical-design survey + a second research pass (see docs/TE
 | 4 | 5 | Trademark screen via **USPTO trademark search API** (free) — never LLM recall. Highest stakes for geo+service names (UDRP risk). |
 | 5 | 3 | Pronounceability: char-level **n-gram model** trained on English words (or CVC-pattern scorer) — CMUdict can't cover invented words. |
 | 6 | 5 | Toxicity screen: Wayback CDX API (free) + Google Safe Browsing (free w/ key) now; backlink-anchor check **deferred** (no good free API). |
-| 7 | 1 | ✅ **Resolved 2026-07-14** — superseded by the **open-cycle model** (see 2026-07-14 entry & TDD §5): the *calculated* drop date can't be in the key (it moves as estimates refine, and is meaningless on renewal), so identity = `id` PK + a partial unique index on the open cycle per domain, plus `verified_at`/`scored_at`. |
+| 7 | 1 | ✅ **Resolved 2026-07-14** — superseded by the **open-cycle model** (see 2026-07-14 entries & TDD §5): the *calculated* drop date can't be in the key (it moves as estimates refine, and is meaningless on renewal), so identity = `id` PK + a partial unique index on the open cycle per domain, plus `verified_at`/`scored_at`. **Amended in review round 2:** `'dropped'` stays OPEN; predicate `NOT IN ('renewed','reregistered','dismissed')`; `lifecycle_status NOT NULL DEFAULT 'unknown'`. |
 
 ---
 

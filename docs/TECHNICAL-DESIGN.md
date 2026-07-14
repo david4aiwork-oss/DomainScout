@@ -11,6 +11,12 @@
 > **comps design resolved to a $0 path** (NameBio free + HumbleWorth self-host,
 > [§4.5](#45-phase-5--two-tier-ai-scoring)); **Phase 8 UI** added (Flask/FastAPI,
 > [§4.7](#47-phase-8--local-review-ui)); **360-day artifact retention**; licenses verified ([§3](#3-surveyed-tool-teardown)).
+>
+> **v2 → v2.1** (owner review round 2, 2026-07-14): `dropped` reclassified as an **open** cycle state (born-closed
+> duplicate bug fixed — [§5](#5-data-schema)); **charset+length gate moved to ingestion** (permanent-DB junk fix) with an
+> `ingest_log` ([§4.2](#42-phase-2--ingestion)); toxicity gate resequenced **after Tier-1** ([§4.5](#45-phase-5--two-tier-ai-scoring));
+> `score` split into **`score-submit`/`score-collect`**; Phase-8 UI pinned to **FastAPI**; NameBio **empirical spike** added
+> as a Phase-5 pre-task; the three review-round-1 items **ratified** ([§7](#7-decisions--open-items)).
 
 ---
 
@@ -90,14 +96,14 @@ re-runnable.
 
 ```
    WhoisFreaks feed ─┐
-   Dynadot auctions ─┴─►│2. ingest │ filter to .com, upsert (partial unique index on open cycle)
+   Dynadot auctions ─┴─►│2. ingest │ .com + charset(^[a-z]+$) + len≤12 gate; upsert (partial unique index on open cycle); ingest_log counts
                         └────┬─────┘
                              ▼
-                        │3. filter │ deterministic: length/charset/dict/pronounceability → filter_pass/reason
+                        │3. filter │ tunable gates only: primary/secondary class + dict + pronounceability → filter_pass/reason
                              ▼ (survivors)
-                        │4. verify │ async RDAP: status, drop_date (status-driven), lifecycle_status, verified_at
+                        │4. verify │ async RDAP: status, drop_date (status-driven), lifecycle_status, verified_at (re-verifies open dropped rows)
                              ▼
-                        │5. score  │ toxicity gate → Tier-1 triage → Tier-2 deep (+NameBio comps +HumbleWorth range)
+                        │5. score  │ Tier-1 triage → toxicity gate (survivors) → Tier-2 deep (+NameBio comps +HumbleWorth range)
                              ▼
                         │7. digest │ ranked markdown, top ~10, action = register/backorder/bid/skip
    6. outcomes ───────────────────────► writes real results back for calibration
@@ -108,11 +114,11 @@ re-runnable.
 
 ```
 domainscout/
-  __main__.py          # argparse dispatch → subcommands (init-db, ingest, filter, verify, score, digest, outcome, prune, web)
+  __main__.py          # argparse dispatch → subcommands (init-db, ingest, filter, verify, score-submit, score-collect, digest, outcome, prune, web)
   config.py            # load + validate criteria.toml (tomllib)
   db.py                # connection, schema DDL, migrations, upsert helpers
   models.py            # dataclasses: Candidate, RdapResult, Scores
-  ingest.py            # Phase 2 (WhoisFreaks + Dynadot adapters, .com filter)
+  ingest.py            # Phase 2 (WhoisFreaks + Dynadot adapters; .com+charset+length gate; ingest_log)
   sources/             #   feed adapters: whoisfreaks.py, dynadot.py
   filters.py           # Phase 3
   pronounce.py         # n-gram pronounceability scorer (+ trained tables)
@@ -124,7 +130,7 @@ domainscout/
   toxicity.py          # Phase 5 pre-score gate (Wayback + Safe Browsing)
   outcomes.py          # Phase 6
   digest.py            # Phase 7
-  web/                 # Phase 8 Flask/FastAPI app (read + write-back)
+  web/                 # Phase 8 FastAPI + uvicorn app (read + write-back)
   retention.py         # prune raw feeds/digests older than N days
 criteria.toml
 data/  domainscout.db · feeds/ · digests/ · ngram_tables.json · namebio_comps.csv
@@ -142,18 +148,34 @@ tests/
 | **Dynadot expired auctions** | Public **auction/closeout inventory** (bid on it) | bid at auction | Public CSV export (`/help/question/download-expired-list`, marketplace `/market/auction`) + account-keyed aftermarket API (`get_open_auctions`, `get_expired_closeout_domains`, `download_all_listings`). ⚠️ *Not* a registry drop list — it's inventory to bid on. |
 
 **Consequences for the design:**
-- **Ingestion filters to `.com`** on the way in (hard invariant per `CLAUDE.md`) — ~5k of 10k/day survive from WhoisFreaks.
-- The feed carries **no lifecycle data**; the `-expired-` vs `-dropped-` filename is the only signal (initial `lifecycle_status`: `expiring` vs `dropped`). Everything else is backfilled by RDAP (Phase 4).
-- **Idempotency:** re-downloading a given date's file + `INSERT ... ON CONFLICT DO UPDATE` on the open-cycle index → repeated runs converge. `first_seen` set on insert only.
-- ⚠️ **The WhoisFreaks free feed has no stated license / data-use terms** — fine for personal use; get written clarification before any commercial use ([§7](#7-decisions--open-items)).
+- **Hard-invariant gate at ingestion (not just `.com`).** Charset (`^[a-z]+$`) and length (≤ `secondary.max_length` = 12)
+  are permanent invariants of the owner criteria, not tunable thresholds — so apply them *at ingestion* and land **only
+  survivors** in `candidates`. This keeps the permanent DB from filling with ~99% junk (~1.8M charset/length failures/year).
+  Order: strip non-`.com` → `^[a-z]+$` → length ≤ 12. *(The length ceiling tracks `secondary.max_length` (12), **not** primary
+  (8) — gating at 8 would discard every secondary-target candidate.)*
+- **Nothing is lost by gating early:** raw feed files are retained 360 days ([§4.7](#47-phase-8--local-review-ui)), so if the
+  criteria are ever loosened we **re-ingest from the retained feeds**. Dictionary & pronounceability stay in Phase 3 because
+  *those* thresholds are tunable.
+- **Auditability:** every run writes an `ingest_log` row (`seen`, `rejected_tld`, `rejected_charset`, `rejected_length`,
+  `landed`) per source/file, so the gate's effect is inspectable in the UI ([§5](#5-data-schema)).
+- The feed carries **no lifecycle data**; the `-expired-` vs `-dropped-` filename sets **`feed_category` only**.
+  `lifecycle_status` stays at its `'unknown'` default until RDAP (Phase 4) backfills it — ingestion must **not** write
+  `lifecycle_status = 'dropped'` from the filename (doing so re-opens the born-closed duplicate bug, [§5](#5-data-schema)).
+- **Idempotency:** re-downloading a given date's file + `INSERT ... ON CONFLICT DO UPDATE` on the open-cycle index →
+  repeated runs converge. `first_seen` set on insert only.
+- **Cron timing:** WhoisFreaks publishes with a **~1-day lag**; schedule the daily run for **late morning** (after the day's
+  files land) so ingestion never races the upload.
+- ⚠️ **The WhoisFreaks free feed has no stated license / data-use terms** — fine for personal use; get written clarification
+  before any commercial use ([§7](#7-decisions--open-items)).
 
 ### 4.3 Phase 3 — Rules filter
 
-Cheapest-gate-first, deterministic, fully logged (`filter_pass` + `filter_reason` per domain):
-1. **Charset/shape:** `^[a-z]+$`, no hyphens/numbers (needed — the feed does no pre-filtering).
-2. **Length:** ≤8 (primary) / 9–12 (secondary), per `criteria.toml`.
-3. **Dictionary (graded, `wordfreq`):** score stem/word-split by `zipf_frequency`; tunable threshold, not binary. Two-word combos scored by min/mean of parts.
-4. **Pronounceability (n-gram, `pronounce.py`):** bigram/trigram frequency model; **whole-word average** score (⚠️ *not* lukem512's hard per-trigram floor, which nukes a good coined word for one odd trigram). Not CVC, not CMUdict (can't score invented-but-pronounceable secondary targets).
+Charset (`^[a-z]+$`) and length (≤12) are already enforced **at ingestion** ([§4.2](#42-phase-2--ingestion)) — permanent
+invariants, not tunable — so Phase 3 handles only the **tunable** gates, deterministic and fully logged (`filter_pass` +
+`filter_reason` per domain):
+1. **Primary/secondary classification:** ≤8 → primary track; 9–12 → secondary track (drives which criteria apply downstream).
+2. **Dictionary (graded, `wordfreq`):** score stem/word-split by `zipf_frequency`; tunable threshold, not binary. Two-word combos scored by min/mean of parts. ⚠️ **`wordfreq` is frozen** (rspeer stopped updating it in 2024, citing LLM-polluted corpora) — fine for stable dictionary words, but *emerging* vocabulary won't register in `zipf_frequency`. Catching micro-trend terms is the Tier-2 Google-Trends context's job ([§4.5](#45-phase-5--two-tier-ai-scoring)), not this gate's.
+3. **Pronounceability (n-gram, `pronounce.py`):** bigram/trigram frequency model; **whole-word average** score (⚠️ *not* lukem512's hard per-trigram floor, which nukes a good coined word for one odd trigram). Not CVC, not CMUdict (can't score invented-but-pronounceable secondary targets).
 
 Target: ~50–200 survivors/day → Phase 4.
 
@@ -168,18 +190,21 @@ Target: ~50–200 survivors/day → Phase 4.
   - only `autoRenewPeriod`/`expiration_date` known → low-confidence estimate; re-check as it advances.
   Prefer exact phase-start dates from the RDAP `events` array when present.
 - **Rate-limiting (build it ourselves):** async semaphore + token-bucket + exponential backoff on `429`; per-run response cache; descriptive `User-Agent` (good practice, not required). Verisign publishes no numeric limit — a modest daily batch is within its ToS; pace politely.
+- **Re-verify open `dropped` rows (not verify-once):** a `dropped`/available row stays *open* until someone re-registers it, and the RDAP 200 that reveals that re-registration is exactly what closes cycle 1 (→ `reregistered`) and frees cycle 2 to open ([§5](#5-data-schema)). So Phase 4 re-checks open `dropped`/`redemption`/`pending_delete` rows on a cadence, not once. `verified_at` drives the recheck interval; the rate-limiter + cache keep it cheap.
 - **Optional DNS pre-filter:** DNS-over-HTTPS A/NS check vs Cloudflare `1.1.1.1` (NXDOMAIN ⇒ likely available) before spending an RDAP call (per `DECISIONS.md` "DNS only as optional pre-filter"; domainsearcher-app's two-stage pattern).
 
 ### 4.5 Phase 5 — Two-tier AI scoring
 
 - **Provider-agnostic** `score(domain, context) → JSON`; default Anthropic (Haiku triage → Sonnet deep, Batch API).
-- **Hybrid local/AI split:** deterministic dims (length, lifecycle, dict/pronounceability from Phase 3) computed locally and passed as **context**; only subjective dims (brandability, memorability, commercial potential, linguistic clarity) are AI-scored.
+- **Batch runs are async (can take hours), so split the step:** `score-submit` (enqueue the batch, persist the batch id) and `score-collect` (poll → write results when ready, else exit cleanly). A single submit-and-wait cron step would hang and break idempotency; two idempotent subcommands keep the daily run safe to re-enter.
+- **Hybrid local/AI split:** deterministic dims (length, lifecycle, dict/pronounceability from Phase 3) computed locally and passed as **context**; only subjective dims (brandability, memorability, commercial potential, linguistic clarity) are AI-scored. Context also carries a **Google Trends signal** for emerging-vocabulary terms — this is what compensates for `wordfreq` being frozen at 2024 ([§4.3](#43-phase-3--rules-filter)); don't expect the Phase-3 dictionary gate to surface trend words.
 - **Comps grounding ($0 path):**
   - **NameBio free API** — real aggregated comparable-sale stats: `RetailStats` (count/avg/max/σ per keyword & placement) + `TLDStats`, both downloadable as **CSV → local cache** (`namebio_comps.csv`), refreshed periodically. **Keep these CSVs permanently** — aggregated stats age slowly, so a cached snapshot stays a usable comps reference even if NameBio changes or goes away (fuller hedge in [§9](#9-future-enhancements)). **Free, attribution required** (cite NameBio in the digest). *(This likely retires `DECISIONS.md` pending proposal #3's $10/mo plan — see [§7](#7-decisions--open-items).)* ⚠️ Do **not** use NameBio's *paid* API — its ToS forbids use in any product/service without written permission.
   - **HumbleWorth** — open-source valuation model **self-hosted via Docker/Cog** (free, CPU, ~2 GB RAM), returning an `auction/marketplace/brokerage` triple = a modeled low/mid/high range. (Hosted Replicate API ~$0.10/1k is the fallback.) ⚠️ A *model estimate*, trained through early-2024 — pair with NameBio's real stats, don't rely on it alone.
   - **Injection:** NameBio real stats (reality band) + HumbleWorth modeled triple (point anchor) → the LLM reconciles into a value range + rationale.
+  - ⚠️ **Empirical spike before Phase-5 prompt design (owner's Concern 3):** the free-tier *load pattern* is untested — scoring 20–30 Tier-2 candidates/day means dozens of keyword lookups against an endpoint whose rate limits and CSV-export mechanics we haven't measured. **Phase-5 pre-task:** pull stats for ~20 sample keywords, confirm the CSV path works, record observed limits. If it underdelivers, **promote the own-comps-table hedge** ([§9](#9-future-enhancements)) from future-enhancement to a Phase-5 component *before* the prompt assumes rich comps context.
 - **Weights are data-calibrated**, not hand-set — tune against Phase 6 outcomes (arXiv Rank-SVM is the template).
-- **Toxicity gate before scoring** (`toxicity.py`): Wayback CDX history *shape* + Google Safe Browsing (both free), following domainhunter's *multi-source reputation* pattern (re-pick live sources). History shape, domain age, and our own prior-drop count also feed a **drop-reason / quality inference** ([§9](#9-future-enhancements)).
+- **Toxicity gate runs *between* Tier-1 and Tier-2, on Tier-1 survivors only** (`toxicity.py`): Wayback CDX history *shape* + Google Safe Browsing (both free), following domainhunter's *multi-source reputation* pattern (re-pick live sources). Sequencing matters — CDX and Safe Browsing are slow, rate-limited network calls, so running them on the ~30 Tier-1 survivors instead of all ~50–200 filter survivors keeps them off the critical path. **Google Safe Browsing needs a (free-tier) Google Cloud API key** → a credentials/signup item ([§7](#7-decisions--open-items)). History shape, domain age, and our own prior-drop count also feed a **drop-reason / quality inference** ([§9](#9-future-enhancements)).
 
 ### 4.6 Phases 6–7 — Outcomes & digest
 
@@ -188,7 +213,7 @@ Target: ~50–200 survivors/day → Phase 4.
 
 ### 4.7 Phase 8 — Local review UI
 
-- **Stack:** **Flask/FastAPI** local web app (owner's choice), read path first, write-back second.
+- **Stack:** **FastAPI + uvicorn** local web app (owner's choice — async-native to match the aiohttp/httpx stack, with auto-generated API docs), read path first, write-back second.
   - *Read:* browse/filter/sort the `candidates` table + Phase 6/7 results; view a candidate's full scores/rationale/lifecycle; browse retained digests.
   - *Write-back:* mark outcomes (backordered/auction price/unsold), edit `criteria.toml` thresholds, flag/dismiss candidates — closing the calibration loop.
 - **Artifact retention:** raw feed files + generated digests kept **360 days**, then `prune` removes older ones (`python -m domainscout prune`). The **SQLite DB (all derived data) is permanent**. Disk ≈ a few hundred MB/year (bounded). Retained artifacts are reviewable through the UI to improve the rubric.
@@ -213,7 +238,7 @@ CREATE TABLE candidates (
   expiry_date       DATE,                       -- registry expiration for this cycle (from RDAP)
   drop_date_est     DATE,                       -- MUTABLE estimate; refined by RDAP status
   drop_date_actual  DATE,                       -- set ONLY when confirmed dropped
-  lifecycle_status  TEXT,                       -- expiring|grace|redemption|pending_delete|dropped|renewed|reregistered|unknown
+  lifecycle_status  TEXT NOT NULL DEFAULT 'unknown',  -- OPEN: unknown|expiring|grace|redemption|pending_delete|dropped(=available now) · CLOSED: renewed|reregistered|dismissed
   rdap_status       TEXT,                       -- raw RDAP status list (JSON)
   verified_at       TIMESTAMP,                  -- idempotent re-run guard
   -- filter (Phase 3)
@@ -232,14 +257,30 @@ CREATE TABLE candidates (
   outcome_date      DATE
 );
 
--- At most ONE open cycle per domain; closed rows (dropped/renewed/reregistered) retained as history.
--- Re-registration after a real drop closes the old row and opens a new one → distinct opportunity rows.
+-- At most ONE open cycle per domain; closed rows (renewed/reregistered/dismissed) retained as history.
+-- 'dropped' is an OPEN state: a dropped-and-registerable domain is the live hand-register opportunity, so it must
+-- stay unique-guarded — otherwise the daily -dropped- feed re-inserts a duplicate every day (ON CONFLICT never fires).
+-- A cycle closes only when the opportunity ends: RDAP-confirmed re-registration, renewal, or owner dismissal.
+-- NOT NULL DEFAULT 'unknown' matters: a NULL makes the partial-index predicate NULL, silently escaping uniqueness.
 CREATE UNIQUE INDEX ux_open_cycle ON candidates(domain)
-  WHERE lifecycle_status NOT IN ('dropped','renewed','reregistered');
+  WHERE lifecycle_status NOT IN ('renewed','reregistered','dismissed');
 
 CREATE INDEX idx_drop_est   ON candidates(drop_date_est);
 CREATE INDEX idx_filter_pass ON candidates(filter_pass);
 CREATE INDEX idx_lifecycle  ON candidates(lifecycle_status);
+
+-- Ingestion audit (§4.2): per-source/day counts — the charset+length gate means not every feed row lands.
+CREATE TABLE ingest_log (
+  run_date          DATE NOT NULL,
+  source            TEXT NOT NULL,              -- 'whoisfreaks' | 'dynadot'
+  feed_file         TEXT NOT NULL,              -- the specific dated file ingested
+  seen              INTEGER,                    -- rows in the feed file
+  rejected_tld      INTEGER,                    -- not .com
+  rejected_charset  INTEGER,                    -- failed ^[a-z]+$
+  rejected_length   INTEGER,                    -- over secondary.max_length (12)
+  landed            INTEGER,                    -- rows inserted/updated into candidates
+  PRIMARY KEY (run_date, source, feed_file)
+);
 ```
 
 **Renewal handling (owner's Q3):** when RDAP shows the registration was renewed (expiry moved forward /
@@ -248,20 +289,30 @@ calibration signal ("liked it, wasn't available"), and exclude it from active ra
 `drop_date_actual` when known, else `drop_date_est`. `verified_at`/`scored_at` let each phase skip
 already-processed rows while re-runs stay safe (upsert converges).
 
+**Cycle-closing states (amended in review round 2).** A cycle closes only when the *opportunity* ends, not
+when a registration lapses — three terminal states: `renewed` (above), `reregistered` (RDAP-confirmed 200
+after a real drop — someone else grabbed it), and `dismissed` (owner rejected it in the UI). Everything else
+— including `dropped`, which is a *live* hand-register opportunity — stays **open** and unique-guarded.
+`lifecycle_status` is `NOT NULL DEFAULT 'unknown'` so a row can never NULL its way out of the partial index.
+
 **Multiple drops over time (owner's f1).** The open-cycle index allows **one open row per domain but
 unlimited closed rows**, so a domain that drops, gets re-registered, and later drops again is modeled as
 **distinct cycle rows**:
 
 | id | domain | lifecycle_status | first_seen | drop_date_actual | note |
 |----|--------|------------------|-----------|------------------|------|
-| 1 | foo.com | dropped | 2026-07-01 | 2026-08-20 | cycle 1: dropped, someone else grabbed it |
-| 2 | foo.com | expiring | 2028-06-05 | (null) | cycle 2: new owner lapsed → fresh open opportunity |
+| 1 | foo.com | reregistered | 2026-07-01 | 2026-08-20 | cycle 1: dropped, then someone else grabbed it → RDAP 200 closes the cycle |
+| 2 | foo.com | dropped | 2028-06-05 | (null) | cycle 2: new owner lapsed and dropped again → fresh **open** opportunity |
 
-Ingestion upserts into the *open* row if one exists
-(`INSERT ... ON CONFLICT(domain) WHERE lifecycle_status NOT IN ('dropped','renewed','reregistered') DO UPDATE`);
-if every prior row is closed, it inserts a new cycle. A drop or renewal closes the current row; a later
-feed reappearance opens the next — full re-registration history, no moving-key bug. A domain's **prior-drop
-count** (rows where `lifecycle_status='dropped'`) is itself a quality signal (see [§9](#9-future-enhancements)).
+`dropped` is itself an **open** state, so the daily `-dropped-` feed re-appearing just upserts the existing
+open row — no duplicate:
+`INSERT ... ON CONFLICT(domain) WHERE lifecycle_status NOT IN ('renewed','reregistered','dismissed') DO UPDATE`.
+The cycle closes only when the opportunity ends — **RDAP-confirmed re-registration** (`reregistered`),
+**renewal** (`renewed`), or **owner dismissal** (`dismissed`) — after which a later feed reappearance opens
+the next cycle. This is why **Phase 4 must periodically re-verify open `dropped` rows** ([§4.4](#44-phase-4--rdap-verification)),
+not verify-once: the RDAP 200 after a confirmed drop is exactly what closes cycle 1 and lets cycle 2 begin.
+A domain's **prior-drop count** (closed rows with a non-null `drop_date_actual`) is itself a quality signal
+(see [§9](#9-future-enhancements)).
 
 ---
 
@@ -293,14 +344,16 @@ Each observed in a surveyed tool, verified:
 - ✅ **Comps:** NameBio **free** RetailStats/TLDStats + HumbleWorth self-host = **$0**.
 - ✅ **Licenses:** whoisit BSD-3, whodap MIT, domainhunter BSD-3, spidy MIT are clean; domainsearcher-app & Williams-Media claim MIT with **no LICENSE file** (patterns-only); domain-watchdog AGPL (study only); **WhoisFreaks feed has no stated terms**.
 
-**Needs owner ratification (touch `DECISIONS.md`):**
-1. **Data-source model:** keep **WhoisFreaks free feed** (drop firehose) **and reclassify Dynadot** as a public **expired-*auction*** source (bid/backorder branch), *not* a hand-register drop list. Replaces the ambiguous "Dynadot drop lists" line.
-2. **Comps:** adopt the **$0 NameBio-free + HumbleWorth-self-host** path; **retire pending proposal #3's** NameBio Basic $10/mo (unless you want the paid comps depth later — but its ToS forbids pipeline use).
-3. **Schema:** adopt the revised **open-cycle** identity model ([§5](#5-data-schema)) in place of `UNIQUE(domain, drop_date)`.
+**Ratified 2026-07-14 (owner review round 2 — recorded in `DECISIONS.md`):**
+1. ✅ **Data-source model** — WhoisFreaks free feed (name firehose → hand-register/backorder) + Dynadot public expired-*auction* CSV (→ bid branch). Personal use only pending WhoisFreaks license clarification.
+2. ✅ **Comps: $0 path** — NameBio free RetailStats/TLDStats (cached CSV, attribution) + HumbleWorth open-source model (hosted endpoint on Windows-local; self-host on VPS later); retires proposal #3 (paid NameBio API ToS forbids pipeline use). **CONDITION:** a ~30-min empirical spike against the NameBio free endpoint (~20 keywords, confirm limits + CSV path) precedes Phase-5 prompt design; if it underdelivers, the own-comps-table hedge ([§9](#9-future-enhancements)) is promoted to a Phase-5 component.
+3. ✅ **Open-cycle schema — amended:** `dropped` is an **open** state (dropped-and-available = the live opportunity); cycles close only on `reregistered`/`renewed`/`dismissed`; index predicate `NOT IN ('renewed','reregistered','dismissed')`; `lifecycle_status NOT NULL DEFAULT 'unknown'`. (Fixes the born-closed duplicate bug the owner caught in review — [§5](#5-data-schema).)
+4. ✅ **Phase 8 UI = FastAPI + uvicorn** (async-native; auto API docs).
 
 **Still open (lower stakes, decide at the phase):**
 - Exact `User-Agent` string / pacing constant for the Verisign batch (pick a polite default, e.g. ≤1–2 req/s).
-- Whether to self-host HumbleWorth (Docker) from day one or start with the free direct endpoint / Replicate API.
+- **NameBio free-tier empirical spike** — Phase-5 pre-task (per ratification #2), run before Phase-5 prompt design.
+- HumbleWorth stays a **hosted endpoint on Windows-local**; **self-host via Docker on the VPS later** ([§9](#9-future-enhancements)).
 
 ---
 
@@ -312,10 +365,11 @@ Each observed in a surveyed tool, verified:
 | `whoisit` | sync RDAP fallback | BSD-3 ✅ |
 | `wordfreq` | graded dictionary match | ratified |
 | `aiohttp`/`httpx` | async I/O (RDAP, DoH, feeds) | permissive |
-| `flask` **or** `fastapi`+`uvicorn` | Phase 8 UI | BSD/MIT ✅ |
-| HumbleWorth model (Docker/Cog) | self-hosted valuation | open-source ✅ |
+| `fastapi` + `uvicorn` | Phase 8 UI (async-native, auto API docs) | MIT ✅ |
+| HumbleWorth model (Docker/Cog) | self-hosted valuation (VPS phase) | open-source ✅ |
 | `tomllib`, `sqlite3`, `csv` | config, storage, feed parse | **stdlib** (3.11+) |
 | Anthropic SDK | Phase 5 scoring | needs API key (Pro ≠ API credits) |
+| Google Safe Browsing | Phase 5 toxicity gate | free-tier Google Cloud API key (signup) |
 
 Stdlib-first keeps the Windows-local → VPS move trivial.
 
@@ -335,7 +389,9 @@ Deferred by design — captured so they aren't lost. None block Phases 1–8.
   outcomes tracker** — every tracked domain's real auction/sale price becomes an owned data point — and
   (b) optional ingestion of **free public sale reports** (e.g. DNJournal weekly sales, NameBio free
   daily-sales) into a local `comps` table. Won't rival NameBio's 6.9M records quickly, but it's owned,
-  growing, and free — insurance against NameBio changing terms.
+  growing, and free — insurance against NameBio changing terms. **Promotion trigger:** if the Phase-5 NameBio
+  empirical spike ([§4.5](#45-phase-5--two-tier-ai-scoring)) underdelivers, this moves from future-enhancement
+  to a Phase-5 component.
 - **Drop-reason inference** *(f2).* The registry never records *why* a domain drops, but likely reason can
   be inferred from a signal bundle and used as a quality signal: Wayback history *shape* (real business
   gone dark = higher quality; never-developed park = speculative churn; content-flip = toxic), domain age /
