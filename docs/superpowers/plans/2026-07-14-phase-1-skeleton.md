@@ -20,6 +20,8 @@
 - **Re-ingest must not reset lifecycle:** the candidate upsert's `DO UPDATE` refreshes `source`/`feed_category` only — it must NOT overwrite `lifecycle_status` (RDAP owns it after ingestion) nor `first_seen` (insert-only).
 - **TDD:** every task writes the failing test first, watches it fail, implements minimally, watches it pass, commits.
 - **Commit style:** conventional prefixes (`feat:`, `test:`, `chore:`, `docs:`). Commit at the end of each task.
+- **Push cadence (owner preference):** commit locally at the end of each task; **push once, at phase end** (Task 7) — not after every task.
+- **Execution mode (owner preference):** Inline execution (superpowers:executing-plans) with batch checkpoints for review — not subagent-driven.
 
 **Spec references:** approved spec `docs/PHASE-1-DESIGN.md`; parent design `docs/TECHNICAL-DESIGN.md` §4.1 (layout), §4.2 (ingestion gate config), §5 (schema).
 
