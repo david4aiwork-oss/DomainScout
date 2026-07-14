@@ -6,12 +6,15 @@ lives solely in download(); the httpx.Client is injected so tests never hit it."
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 
 import httpx
 
+from domainscout import db
 from domainscout.config import Criteria
-from domainscout.sources.base import FeedFile
+from domainscout.models import Candidate, IngestCounts
+from domainscout.sources.base import FeedFile, FeedSource
 
 DEFAULT_FEEDS_DIR = "data/feeds"
 
@@ -40,3 +43,41 @@ def download(feed_file: FeedFile, feeds_dir: str | Path, client: httpx.Client) -
     resp.raise_for_status()
     dest.write_bytes(resp.content)
     return dest
+
+
+def ingest_file(
+    conn,
+    source: FeedSource,
+    *,
+    path: Path,
+    feed_category: str,
+    feed_file_name: str,
+    run_date: date,
+    criteria: Criteria,
+    dry_run: bool = False,
+) -> IngestCounts:
+    """Gate every name in one local feed file; upsert survivors and log counts."""
+    counts = IngestCounts(source=source.name, feed_file=feed_file_name, run_date=run_date)
+    for raw in source.iter_domains(Path(path)):
+        counts.seen += 1
+        ok, reason = gate(raw, criteria)
+        if ok:
+            counts.landed += 1
+            if not dry_run:
+                db.upsert_candidate(
+                    conn,
+                    Candidate(
+                        domain=raw.strip().lower(),
+                        source=source.name,
+                        feed_category=feed_category,
+                    ),
+                )
+        elif reason == "rejected_tld":
+            counts.rejected_tld += 1
+        elif reason == "rejected_charset":
+            counts.rejected_charset += 1
+        else:  # "rejected_length"
+            counts.rejected_length += 1
+    if not dry_run:
+        db.record_ingest(conn, counts)
+    return counts
