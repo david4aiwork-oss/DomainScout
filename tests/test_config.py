@@ -109,6 +109,26 @@ def test_whoisfreaks_missing_key_raises(tmp_path):
         load_criteria(_write(tmp_path, bad))
 
 
+def test_filter_knobs_default_when_absent(tmp_path):
+    crit = load_criteria(_write(tmp_path, VALID_TOML))  # VALID_TOML has no allow_invented/combine
+    assert crit.primary_allow_invented is True
+    assert crit.dictionary_combine == "min"
+
+
+def test_filter_knobs_explicit(tmp_path):
+    toml = VALID_TOML.replace("[primary]\n", "[primary]\nallow_invented = false\n")
+    toml = toml.replace("[dictionary]\n", "[dictionary]\ncombine = \"mean\"\n")
+    crit = load_criteria(_write(tmp_path, toml))
+    assert crit.primary_allow_invented is False
+    assert crit.dictionary_combine == "mean"
+
+
+def test_bad_combine_rejected(tmp_path):
+    toml = VALID_TOML.replace("[dictionary]\n", "[dictionary]\ncombine = \"median\"\n")
+    with pytest.raises(ConfigError, match="combine"):
+        load_criteria(_write(tmp_path, toml))
+
+
 def test_repo_criteria_toml_is_valid():
     # Guards against the shipped config drifting out of sync with the loader.
     crit = load_criteria(REPO_ROOT / "criteria.toml")

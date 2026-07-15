@@ -38,6 +38,8 @@ class Criteria:
     rdap_max_rps: float
     retention_days: int
     whoisfreaks: WhoisFreaksConfig | None = None
+    primary_allow_invented: bool = True
+    dictionary_combine: str = "min"
 
     @property
     def ingest_max_length(self) -> int:
@@ -63,6 +65,12 @@ def _as_float(value: Any, where: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"criteria.toml: {where} must be a number, got {value!r}")
     return float(value)
+
+
+def _as_bool(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"criteria.toml: {where} must be a boolean, got {value!r}")
+    return value
 
 
 def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
@@ -109,6 +117,15 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
             dropped_filename=str(wf["dropped_filename"]),
         )
 
+    allow_invented = _as_bool(
+        data["primary"].get("allow_invented", True), "[primary].allow_invented"
+    )
+    combine = str(data["dictionary"].get("combine", "min"))
+    if combine not in ("min", "mean"):
+        raise ConfigError(
+            f"criteria.toml: [dictionary].combine must be 'min' or 'mean', got {combine!r}"
+        )
+
     return Criteria(
         tld=tld,
         charset=charset,
@@ -126,4 +143,6 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
         rdap_max_rps=_as_float(_require(data, "rdap", "max_requests_per_sec"), "[rdap].max_requests_per_sec"),
         retention_days=_as_int(_require(data, "retention", "days"), "[retention].days"),
         whoisfreaks=whoisfreaks,
+        primary_allow_invented=allow_invented,
+        dictionary_combine=combine,
     )

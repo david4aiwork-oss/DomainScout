@@ -11,6 +11,7 @@ schedule_hint = "late-morning"    # WhoisFreaks feed has ~1-day lag; don't race 
 [primary]                         # <=8-char dictionary .com
 max_length = 8
 max_words = 2
+allow_invented = true             # true: short invented-but-pronounceable names pass via the pronounce gate
 
 [secondary]                       # 9-12-char invented / geo+service
 min_length = 9
@@ -18,6 +19,7 @@ max_length = 12                   # widest target => also the derived ingestion 
 
 [dictionary]
 zipf_min = 3.0                    # wordfreq zipf_frequency threshold (tunable)
+combine = "min"                   # two-word split score = min|mean of the parts
 
 [pronounceability]
 min_score = 0.02                  # n-gram floor (tunable; calibrate against outcomes later)
