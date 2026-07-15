@@ -1,6 +1,8 @@
 # Phase 3 — Rules filter: design
 
-**Status:** 📝 **DRAFT — pending owner approval (2026-07-14).** Brainstormed via superpowers.
+**Status:** ✅ **BUILT 2026-07-14.** Brainstormed + built via superpowers (9-task TDD plan).
+See **Build notes** at the end for the two execution-time refinements (dict split floor ≥3; the
+`pronounce_min_score = -4.0` "mash-only" calibration + the revised survivor-volume expectation).
 Parent design: `docs/TECHNICAL-DESIGN.md` §4.1 (module layout), §4.3 (rules filter), §5 (schema).
 
 **Goal:** Deterministic, **no-network**, fully-logged tunable filter over the open `candidates` Phase 2 landed.
@@ -75,7 +77,9 @@ domainscout/
   (every label is already ≤12 from ingestion, so this is just the 8/9 boundary).
 - **`dict_score(label, criteria) -> tuple[float, str]`** — returns `(score, segmentation)`:
   - `whole = zipf_frequency(label, "en")`; candidate segmentation `label`.
-  - for each split point `i` where **both** parts have length ≥ 2: `combine(zipf(left), zipf(right))` (default `min`).
+  - for each split point `i` where **both** parts have length ≥ 3: `combine(zipf(left), zipf(right))` (default `min`).
+    *(Raised from ≥2 at build time — see Build notes: wordfreq gives 2-letter fragments substantial zipf,
+    so a ≥2 floor let consonant-mash like `thng`→`th`+`ng` falsely clear the dict gate.)*
   - `score = max(whole, best split combine)`; `segmentation` = the winner (`label` or `"left+right"`).
 - **`pronounce_score(label) -> float`** — delegates to `pronounce.score` (log space; see below).
 - **`decide(track, dict_score, seg, pronounce_score, criteria) -> tuple[bool, str]`** — the approved rule:
@@ -172,7 +176,8 @@ python -m domainscout build-ngrams [--top-n 50000] [--out domainscout/pronounce_
 
 - **`classify`** — boundaries: 8 → primary, 9 & 12 → secondary.
 - **`dict_score`** — whole-word (`apple` high), best 2-way split (`redfox` → `red+fox`, score = `min`), non-word (`xqzk` ≈ 0),
-  returns the winning segmentation; 1-char fragments never win (both parts ≥ 2).
+  returns the winning segmentation; fragments < 3 chars never win (both parts ≥ 3; regression test pins the floor so
+  2-letter wordfreq noise like `th`/`ng` can't re-admit consonant-mash).
 - **`pronounce.score`** — tests inject a **small deterministic fixture table** (no dependency on the 50k build) and assert:
   real-word > invented-pronounceable > keyboard-mash ordering; smoothing (an unseen trigram is finite, not `-inf`).
 - **`score` scale-contract** — on the fixture: every score **finite and ≤ 0** (log space) and **monotonic** across the
@@ -212,3 +217,36 @@ python -m domainscout build-ngrams [--top-n 50000] [--out domainscout/pronounce_
 - **Scope:** one phase — classification + two tunable gates + persistence + CLI; no RDAP/scoring bleed-in.
 - **Isolation:** pure scoring (`classify`/`dict_score`/`pronounce.score`/`decide`) separated from the DB loop
   (`filter_candidates`) and the table build (`build-ngrams`); each independently testable with fixtures, no network.
+
+---
+
+## Build notes (2026-07-14)
+
+Built via the 9-task TDD plan (`docs/superpowers/plans/2026-07-14-phase-3-rules-filter.md`). 91 tests pass, no network in
+the suite. Two refinements were made against real data and ratified by the owner:
+
+**1. Dictionary split-part floor raised ≥2 → ≥3 chars.** `wordfreq` assigns 2-letter fragments substantial zipf
+(`th`=4.2, `ng`=3.9, `aa`=4.01), so a ≥2 floor let consonant-mash clear the dictionary gate via a bogus split
+(`thng`→`th`+`ng`, min 3.9 ≥ 3.0). The ≥3 floor kills that noise and loses no genuine multi-word target (real combos —
+`red+fox`, `plano+hvac` — use ≥3-char words). A regression test (`test_dict_score_no_two_char_fragment_noise`) pins it.
+
+**2. `pronounce_min_score` calibrated to −4.0 — a MASH-ONLY gate — and the survivor-volume target revised.**
+Calibrated on the 2026-07-11 live feed (3,717 candidates through the ingestion gate):
+
+- The **dictionary gate alone passes 472** (122 primary ≤8-char gems + 350 secondary) — already **above** the design's
+  "~50–200/day" figure before pronounceability adds anything.
+- Real expired .coms are overwhelmingly pronounceable (pronounce-score median −2.94, p10 −3.81, p5 −4.04), so the
+  pronounceability OR-gate is a **wide net**, especially for the secondary (9–12) track.
+- The trigram model **cannot separate borderline invented from borderline mash** — they score identically (good `zylo`
+  −3.88 / `nuvex` −3.61 / `hvac` −3.79 vs mash `vgkxq` −3.88 / `bwqkx` −3.92). Only unambiguous mash is cleanly below
+  (`xqzk` −4.23, `qwrtz` −4.11, `ktzzr` −4.30).
+- **Consequence:** "~50–200/day" and "keep invented-name recall" are mutually exclusive at this stage — a floor tight
+  enough to reach ~200 (≈ −2.2) also rejects the invented names the secondary track exists to catch. Volume control past
+  mash-removal belongs to the downstream **Tier-1 (Haiku) triage**, which is the next designed funnel.
+- **Owner decision (2026-07-14):** set the floor to **−4.0 (mash-only, max recall)**. Survivor sweep for reference:
+  −2.5→818, −2.75→1,388, −3.0→2,085, −3.5→3,064, **−4.0→3,498** (primary 1,162 / secondary 2,336; 219 mash rejected).
+  The "~50–200/day" figure in this doc and `CLAUDE.md` is therefore a **post-Tier-1** expectation, not a rules-filter one.
+  The floor is a one-line `criteria.toml` tunable; the Phase-6 outcome loop can retune it against real results.
+
+**Artifact:** `domainscout/pronounce_tables.json` = **74 KB** (47,973 word types, top-50k after the `^[a-z]+$` filter);
+integer counts, sorted keys, `_meta` embedded. Well under the size ceiling — no gzip needed. Shipped as package data.

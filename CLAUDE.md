@@ -21,7 +21,7 @@ Personal expired-domain discovery pipeline. Finds quality expiring/dropped **.co
 
 1. **Skeleton** — SQLite DB, config file for criteria, CLI structure
 2. **Ingestion** — daily pull into `candidates`. Apply the **hard-invariant gate at ingestion** (.com → charset `^[a-z]+$` → length ≤12, the non-tunable criteria) so only survivors land in the permanent DB; log per-run counts to `ingest_log`. Retained feeds (360d) allow re-ingest if criteria loosen. Dedup via open-cycle upsert; idempotent daily runs. Schedule late-morning (feed has ~1-day lag)
-3. **Rules filter** — deterministic, cheap (charset+length already gated at ingestion). Handles the **tunable** gates: primary/secondary classification (≤8 vs 9–12), dictionary matching via `wordfreq` (frozen at 2024 — emerging terms are Tier-2's job), pronounceability heuristic. Must log pass/fail reason per domain. Should cut candidates to ~50–200/day
+3. **Rules filter** — deterministic, cheap (charset+length already gated at ingestion). Handles the **tunable** gates: primary/secondary classification (≤8 vs 9–12), dictionary matching via `wordfreq` (frozen at 2024 — emerging terms are Tier-2's job), pronounceability heuristic. Must log pass/fail reason per domain. (Built 2026-07-14: the "~50–200/day" figure proved unreachable here without gutting invented-name recall — real expired .coms are overwhelmingly pronounceable, and the dict gate alone passes ~470/day. The pronounceability floor is calibrated as a **mash-only** gate (−4.0), leaving ~3.5k/day survivors; **~50–200/day is a post-Tier-1-triage target, not a rules-filter one.** See docs/PHASE-3-DESIGN.md Build notes.)
 4. **RDAP verification** — async, rate-limited (own backoff + cache; query the Verisign `.com` endpoint directly, NOT the rdap.org aggregator which caps at 10 req/10s). Tag status and compute drop date **status-driven** (fixed 30d redemption + 5d pendingDelete tail; the pre-drop auto-renew grace is registrar-variable). Use RDAP, NOT port-43 WHOIS (deprecated). Client: `whodap` (async, MIT)
 5. **Two-tier AI scoring** (Anthropic API):
    - Tier 1: cheap model (Haiku) coarse triage on rules-filter survivors
@@ -72,7 +72,7 @@ Identity = surrogate `id` PK + partial unique index `UNIQUE(domain) WHERE lifecy
 
 - [x] Phase 1: skeleton
 - [x] Phase 2: ingestion (WhoisFreaks free feed real; Dynadot = interface stub / Phase 2b)
-- [ ] Phase 3: rules filter
+- [x] Phase 3: rules filter (wordfreq dict gate + log-space trigram pronounceability; mash-only floor −4.0)
 - [ ] Phase 4: RDAP verification
 - [ ] Phase 5: AI scoring
 - [ ] Phase 6: outcomes tracker

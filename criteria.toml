@@ -23,7 +23,13 @@ combine = "min"                   # two-word split score = min|mean of the parts
 
 [pronounceability]
 min_score = -4.0                  # LOG-space mean-log-prob floor; pass if score >= this.
-                                  # PROVISIONAL — recalibrated on a real feed in Phase 3 Task 9.
+                                  # Calibrated 2026-07-14 on the 2026-07-11 feed (3717 candidates):
+                                  # a MASH-ONLY gate. Removes only unambiguous keyboard-mash
+                                  # (xqzk -4.23, qwrtz -4.11, ktzzr -4.30; ~6%/p5=-4.04) while keeping
+                                  # every legitimate invented/geo name (zylo -3.88, nuvex -3.61, hvac -3.79).
+                                  # The trigram model can't separate borderline invented from borderline
+                                  # mash, so a tighter floor only costs recall. Volume control past mash
+                                  # removal is the Tier-1 (Haiku) triage's job — see docs/PHASE-3-DESIGN.md.
 
 [scoring]
 tier2_cutoff = 30                 # deep-score top N

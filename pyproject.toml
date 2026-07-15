@@ -19,5 +19,8 @@ domainscout = "domainscout.__main__:main"
 [tool.setuptools]
 packages = ["domainscout", "domainscout.sources", "domainscout.scoring", "domainscout.web"]
 
+[tool.setuptools.package-data]
+domainscout = ["pronounce_tables.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

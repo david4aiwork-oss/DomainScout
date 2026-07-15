@@ -38,8 +38,8 @@ def build_tables(top_n: int = 50000, words: list[str] | None = None) -> dict:
             trigram_counts[tri] = trigram_counts.get(tri, 0) + 1
             context2_totals[ctx] = context2_totals.get(ctx, 0) + 1
     try:
-        import wordfreq
-        wf_version = getattr(wordfreq, "__version__", "unknown")
+        from importlib.metadata import version as _pkg_version
+        wf_version = _pkg_version("wordfreq")  # wordfreq exposes no __version__ attr
     except Exception:
         wf_version = "unknown"
     meta = {
