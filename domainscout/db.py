@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS candidates (
   verified_at        TIMESTAMP,
   filter_pass        BOOLEAN,
   filter_reason      TEXT,
+  track              TEXT,
+  dict_score         REAL,
+  pronounce_score    REAL,
+  filtered_at        TIMESTAMP,
   tier1_score        REAL,
   tier2_scores       TEXT,
   value_range        TEXT,
@@ -65,6 +69,23 @@ CREATE TABLE IF NOT EXISTS ingest_log (
 """
 
 
+# Columns added after the initial candidates schema — migrated in on existing DBs.
+_MIGRATION_COLUMNS = [
+    ("track", "TEXT"),
+    ("dict_score", "REAL"),
+    ("pronounce_score", "REAL"),
+    ("filtered_at", "TIMESTAMP"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotently add any missing post-initial columns (PRAGMA-guarded)."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(candidates)")}
+    for name, decl in _MIGRATION_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE candidates ADD COLUMN {name} {decl}")
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -79,6 +100,7 @@ def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
@@ -112,6 +134,32 @@ def upsert_candidate(conn: sqlite3.Connection, candidate: Candidate) -> int:
     row_id = cur.fetchone()[0]
     conn.commit()
     return row_id
+
+
+def set_filter_result(
+    conn: sqlite3.Connection,
+    candidate_id: int,
+    *,
+    track: str,
+    dict_score: float,
+    pronounce_score: float,
+    filter_pass: bool,
+    filter_reason: str,
+    filtered_at: str | None = None,
+) -> None:
+    """Write the 6 Phase-3 filter columns for one candidate. Touches nothing else."""
+    stamp = filtered_at or datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        UPDATE candidates
+           SET track = ?, dict_score = ?, pronounce_score = ?,
+               filter_pass = ?, filter_reason = ?, filtered_at = ?
+         WHERE id = ?
+        """,
+        (track, dict_score, pronounce_score, 1 if filter_pass else 0,
+         filter_reason, stamp, candidate_id),
+    )
+    conn.commit()
 
 
 def record_ingest(conn: sqlite3.Connection, counts: IngestCounts) -> None:

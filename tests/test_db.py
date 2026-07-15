@@ -115,6 +115,60 @@ def test_closed_and_open_rows_coexist(tmp_path):
     assert count == 2
 
 
+def test_init_db_adds_filter_columns_to_existing_db(tmp_path):
+    import re
+
+    dbp = tmp_path / "d.db"
+    # Simulate a REAL pre-Phase-3 DB: the shipped schema minus the 4 migrated
+    # columns (a minimal hand-made table would be missing base columns the
+    # indexes reference — an unrealistic starting point).
+    old_schema = db.SCHEMA
+    for name, _decl in db._MIGRATION_COLUMNS:
+        old_schema = re.sub(rf"\n[^\n]*\b{name}\b[^\n]*,", "", old_schema, count=1)
+    conn = sqlite3.connect(dbp)
+    conn.executescript(old_schema)
+    conn.commit()
+    pre = {r[1] for r in conn.execute("PRAGMA table_info(candidates)")}
+    conn.close()
+    # sanity: the simulated old DB really lacks the 4 new columns
+    assert not ({"track", "dict_score", "pronounce_score", "filtered_at"} & pre)
+
+    db.init_db(dbp)  # must migrate
+    conn = db.connect(dbp)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)")}
+    assert {"track", "dict_score", "pronounce_score", "filtered_at"} <= cols
+
+
+def test_init_db_migration_is_idempotent(tmp_path):
+    dbp = tmp_path / "d.db"
+    db.init_db(dbp)
+    db.init_db(dbp)  # second run must not raise (columns already exist)
+    conn = db.connect(dbp)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)")}
+    assert {"track", "dict_score", "pronounce_score", "filtered_at"} <= cols
+
+
+def test_set_filter_result_writes_all_fields(tmp_path):
+    dbp = tmp_path / "d.db"
+    db.init_db(dbp)
+    conn = db.connect(dbp)
+    cid = db.upsert_candidate(conn, Candidate(domain="redfox.com", source="whoisfreaks"))
+    db.set_filter_result(
+        conn, cid, track="primary", dict_score=3.4, pronounce_score=-2.1,
+        filter_pass=True, filter_reason="primary dict=3.40 red+fox",
+    )
+    row = conn.execute(
+        "SELECT track, dict_score, pronounce_score, filter_pass, filter_reason, filtered_at "
+        "FROM candidates WHERE id=?", (cid,)
+    ).fetchone()
+    assert row["track"] == "primary"
+    assert row["dict_score"] == 3.4
+    assert row["pronounce_score"] == -2.1
+    assert row["filter_pass"] == 1
+    assert "red+fox" in row["filter_reason"]
+    assert row["filtered_at"] is not None  # timestamp set
+
+
 def test_record_ingest_is_idempotent_per_file(tmp_path):
     dbp = tmp_path / "d.db"
     db.init_db(dbp)
