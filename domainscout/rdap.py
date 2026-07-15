@@ -13,6 +13,7 @@ import truststore
 from whodap import DNSClient, DomainResponse
 from whodap.errors import NotFoundError
 
+from domainscout import db, lifecycle
 from domainscout.models import RdapObservation
 
 
@@ -61,3 +62,29 @@ async def lookup_one(dns_client: DNSClient, label: str) -> RdapObservation:
     except NotFoundError:
         resp = None
     return parse_observation(resp)
+
+
+_SELECT_DUE_SQL = """
+SELECT id, domain, feed_category, lifecycle_status, drop_date_actual, verified_at
+FROM candidates
+WHERE lifecycle_status NOT IN ('renewed','reregistered','dismissed')
+  AND filter_pass = 1
+ORDER BY (feed_category = 'dropped') DESC,
+         (drop_date_est IS NULL), drop_date_est ASC,
+         (verified_at IS NULL) DESC, verified_at ASC
+"""
+
+
+def select_due(conn, criteria, now: datetime, recheck_all: bool) -> list:
+    """Open + filter_pass rows to verify this run, in priority order (dropped-feed first, then
+    soonest-drop, then stalest). Cadence-filtered unless recheck_all. No LIMIT — caller slices."""
+    rows = conn.execute(_SELECT_DUE_SQL).fetchall()
+    if recheck_all:
+        return list(rows)
+    due = []
+    for r in rows:
+        va = r["verified_at"]
+        va_dt = datetime.fromisoformat(va) if va else None
+        if lifecycle._is_due(r["lifecycle_status"], va_dt, now, criteria.rdap_recheck_days):
+            due.append(r)
+    return due

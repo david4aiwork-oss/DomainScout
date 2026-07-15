@@ -1,10 +1,17 @@
 import asyncio
 import json
+from datetime import datetime
+from pathlib import Path
 
 from whodap import DomainResponse
 from whodap.errors import NotFoundError
 
-from domainscout import rdap
+from domainscout import db, rdap
+from domainscout.config import load_criteria
+from domainscout.models import Candidate
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CRIT = load_criteria(REPO_ROOT / "criteria.toml")
 
 
 def _resp(status, events):
@@ -57,3 +64,49 @@ def test_new_dns_client_presets_com_map():
     import httpx
     client = rdap._new_dns_client(httpx.AsyncClient(), "https://rdap.verisign.com/com/v1/")
     assert client.iana_dns_server_map == {"com": "https://rdap.verisign.com/com/v1/"}
+
+
+def _seed(conn, domain, *, feed_category="expired", filter_pass=1,
+          lifecycle_status="unknown", verified_at=None, drop_date_est=None):
+    cid = db.upsert_candidate(conn, Candidate(domain=domain, source="whoisfreaks",
+                                              feed_category=feed_category))
+    conn.execute(
+        "UPDATE candidates SET filter_pass=?, lifecycle_status=?, verified_at=?, drop_date_est=? WHERE id=?",
+        (filter_pass, lifecycle_status, verified_at, drop_date_est, cid))
+    conn.commit()
+    return cid
+
+
+def _due_domains(conn, recheck_all=False, now=datetime(2026, 7, 15, 12, 0, 0)):
+    return [r["domain"] for r in rdap.select_due(conn, CRIT, now, recheck_all)]
+
+
+def test_select_due_excludes_closed_and_unfiltered(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "open.com", filter_pass=1)
+    _seed(conn, "closed.com", filter_pass=1, lifecycle_status="renewed")
+    _seed(conn, "unfiltered.com", filter_pass=0)
+    assert _due_domains(conn) == ["open.com"]
+
+
+def test_select_due_orders_dropped_feed_first(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    # both never-verified, both NULL drop_date_est -> only feed_category breaks the tie
+    _seed(conn, "expired.com", feed_category="expired")
+    _seed(conn, "dropped.com", feed_category="dropped")
+    assert _due_domains(conn)[0] == "dropped.com"
+
+
+def test_select_due_applies_cadence(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    # redemption verified 1 day ago, cadence 2 -> NOT due
+    _seed(conn, "fresh.com", lifecycle_status="redemption", verified_at="2026-07-14T12:00:00")
+    # redemption verified 3 days ago -> due
+    _seed(conn, "stale.com", lifecycle_status="redemption", verified_at="2026-07-12T12:00:00")
+    assert _due_domains(conn) == ["stale.com"]
+
+
+def test_select_due_recheck_all_ignores_cadence(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "fresh.com", lifecycle_status="redemption", verified_at="2026-07-14T12:00:00")
+    assert _due_domains(conn, recheck_all=True) == ["fresh.com"]
