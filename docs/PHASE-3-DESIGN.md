@@ -96,21 +96,21 @@ domainscout/
 
 - **`build_tables(top_n=50000) -> dict`** — from `wordfreq.top_n_list("en", top_n)`, keep word **types** matching
   `^[a-z]+$` (unweighted — the *shape* of valid English words, not usage frequency). Boundary-pad each word `^^word$`
-  and count bigrams + trigrams. Emit a dict of **integer counts** + `_meta`, JSON with **sorted keys**:
+  and count trigrams (+ their 2-char context totals). Emit a dict of **integer counts** + `_meta`, JSON with **sorted keys**:
   ```json
   {
     "_meta": {"top_n": 50000, "wordfreq_version": "…", "built": "YYYY-MM-DD",
               "alphabet": "a-z + '^' start + '$' end", "smoothing": "add-one at load, V=27"},
     "trigram_counts":  {"^^a": N, "the": N, …},
-    "context2_totals": {"^^": N, "^a": N, …},   // denominators for P(c3|c1c2)
-    "bigram_counts":   {"^a": N, …},
-    "context1_totals": {"^": N, …}              // bigram fallback for len<3
+    "context2_totals": {"^^": N, "^a": N, …}    // denominators for P(c3|c1c2)
   }
   ```
 - **Load (lazy singleton) + smoothing at load** — add-one (Laplace): `P(c3|c1c2) = (trigram+1) / (context2_total + V)`,
   `V = 27` (26 letters + end `$`). Smoothing lives here, in code, not in the artifact.
 - **`score(label) -> float`** — boundary-pad `^^label$`; return the **mean of log P** over the `len(label)+1` trigram
-  positions (bigram model for `len < 3`). Log space → always ≤ 0, finite (smoothing guarantees no `-inf`).
+  positions. **Trigram-uniform for all lengths** (no separate bigram path for short labels — two scoring spaces would put
+  short primary ≤8 labels on a different scale than long ones, reintroducing the length-inconsistency `allow_invented`
+  makes decisive; boundary padding + smoothing already make short labels well-defined). Log space → always ≤ 0, finite.
 - **`build-ngrams` CLI** regenerates `pronounce_tables.json` (dev/maintenance; not in the daily cron). Byte-deterministic
   save (sorted keys, integer counts) so a rebuild diff = real corpus change, never float jitter.
 
@@ -177,7 +177,7 @@ python -m domainscout build-ngrams [--top-n 50000] [--out domainscout/pronounce_
   real-word > invented-pronounceable > keyboard-mash ordering; smoothing (an unseen trigram is finite, not `-inf`).
 - **`score` scale-contract** — on the fixture: every score **finite and ≤ 0** (log space) and **monotonic** across the
   ordered sample. Pins the space so an arithmetic↔log refactor can't pass the ordering tests while shifting threshold semantics.
-- **`build_tables`** — small synthetic word list → known integer bigram/trigram counts + boundary padding; `_meta` present.
+- **`build_tables`** — small synthetic word list → known integer trigram counts + boundary padding; `_meta` present.
 - **`decide` matrix** (all six meaningful branches) — primary dict-pass; primary invented-pass (`allow_invented=true`);
   primary invented-**reject** (`allow_invented=false`); secondary pronounce-only; secondary dict-only; secondary both-fail.
 - **DB migration** — `init_db` on a pre-Phase-3 schema adds the 4 columns idempotently (PRAGMA path); all 6 present after.
