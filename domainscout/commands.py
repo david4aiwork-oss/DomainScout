@@ -7,8 +7,6 @@ import argparse
 from datetime import date, timedelta
 from pathlib import Path
 
-import httpx
-
 from domainscout import db, ingest
 from domainscout.config import load_criteria
 
@@ -51,7 +49,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             ]
         else:
             source_names = args.source or list(criteria.sources)
-            client = httpx.Client(timeout=30.0, follow_redirects=True)
+            client = ingest.make_client()
             try:
                 results = ingest.run_ingest(
                     conn, criteria=criteria, run_date=run_date,

@@ -6,11 +6,13 @@ lives solely in download(); the httpx.Client is injected so tests never hit it."
 from __future__ import annotations
 
 import re
+import ssl
 from datetime import date
 from pathlib import Path
 from typing import Callable
 
 import httpx
+import truststore
 
 from domainscout import db
 from domainscout.config import Criteria
@@ -39,6 +41,17 @@ def gate(domain: str, criteria: Criteria) -> tuple[bool, str | None]:
     if len(label) > criteria.ingest_max_length:
         return (False, "rejected_length")
     return (True, None)
+
+
+def make_client(timeout: float = 30.0) -> httpx.Client:
+    """Build an httpx.Client that verifies TLS against the OS trust store.
+
+    This box (and many Windows machines) runs an AV/proxy that intercepts HTTPS
+    with a private root CA present in the OS store but absent from certifi;
+    truststore makes verification use the OS store. Portable: the Windows store
+    here, the system CA store on a future Linux VPS."""
+    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return httpx.Client(verify=ctx, follow_redirects=True, timeout=timeout)
 
 
 def download(feed_file: FeedFile, feeds_dir: str | Path, client: httpx.Client) -> Path:
@@ -126,7 +139,7 @@ def ingest_source(
             path = download(feed_file, feeds_dir, client)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
-                print(f"warning: {feed_file.remote_url} not published yet (404) — skipping")
+                print(f"warning: {feed_file.remote_url} not published yet (404) - skipping")
                 continue
             raise
         results.append(

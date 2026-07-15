@@ -30,6 +30,14 @@ def _source():
     return WhoisFreaksSource.from_criteria(CRIT)
 
 
+def test_make_client_builds_os_trust_store_client():
+    client = ingest.make_client()
+    try:
+        assert isinstance(client, httpx.Client)
+    finally:
+        client.close()
+
+
 def test_download_writes_file_and_returns_path(tmp_path):
     ff = FeedFile(source="whoisfreaks", feed_category="expired",
                   remote_url="https://host/x.csv", local_name="x.csv")
