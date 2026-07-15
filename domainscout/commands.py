@@ -4,15 +4,16 @@ friendly stubs that name the phase that will implement them."""
 from __future__ import annotations
 
 import argparse
+import asyncio
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
-from domainscout import db, filters, ingest, pronounce
+from domainscout import db, filters, ingest, pronounce, rdap
 from domainscout.config import load_criteria
 
 # Subcommand -> the phase number that will implement it.
 STUB_PHASES: dict[str, int] = {
-    "verify": 4,
     "score-submit": 5,
     "score-collect": 5,
     "outcome": 6,
@@ -80,6 +81,38 @@ def cmd_filter(args: argparse.Namespace) -> int:
         f"rejected={counts.rejected}"
         + ("  [dry-run]" if args.dry_run else "")
     )
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    criteria = load_criteria(args.criteria)
+    if args.concurrency:
+        criteria = replace(criteria, rdap_concurrency=args.concurrency)  # --concurrency override
+    conn = db.connect(args.db)
+    try:
+        if args.domain:
+            obs, upd, dns, wrote = asyncio.run(
+                rdap.verify_single(criteria, args.domain, conn=conn, dry_run=args.dry_run))
+            print(f"verify {args.domain}: available={obs.available} status={list(obs.status)}")
+            print(f"  -> lifecycle={upd.lifecycle_status} drop_est={upd.drop_date_est} "
+                  f"expiry={upd.expiry_date} dns={dns} written={wrote}")
+            return 0
+        counts = asyncio.run(rdap.run_verify(
+            conn, criteria, limit=args.limit, recheck_all=args.recheck_all, dry_run=args.dry_run))
+    finally:
+        conn.close()
+    print(
+        f"verify: processed={counts.processed} dropped={counts.dropped} "
+        f"redemption={counts.redemption} pending_delete={counts.pending_delete} "
+        f"grace={counts.grace} renewed={counts.renewed} reregistered={counts.reregistered} "
+        f"errors={counts.errors}"
+        + ("  [dry-run]" if args.dry_run else "")
+    )
+    if counts.left_for_next_run:
+        print(f"  {counts.left_for_next_run} due rows left for the next run (raise --limit to drain faster)")
+    if counts.unmatched:
+        pairs = ", ".join(f"{s!r}={n}" for s, n in sorted(counts.unmatched.items()))
+        print(f"  unmatched RDAP statuses: {pairs}")
     return 0
 
 

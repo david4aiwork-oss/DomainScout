@@ -9,7 +9,6 @@ from domainscout import __version__, commands
 from domainscout.db import DEFAULT_DB_PATH
 
 _STUB_HELP = {
-    "verify": "[Phase 4] RDAP verification and status-driven drop dates",
     "score-submit": "[Phase 5] submit the AI scoring batch",
     "score-collect": "[Phase 5] collect AI scoring batch results",
     "digest": "[Phase 7] generate the ranked daily digest",
@@ -62,6 +61,21 @@ def build_parser() -> argparse.ArgumentParser:
                           help="number of top English words to train on (default: 50000)")
     p_ngrams.add_argument("--out", help="output path (default: domainscout/pronounce_tables.json)")
     p_ngrams.set_defaults(func=commands.cmd_build_ngrams)
+
+    p_verify = sub.add_parser(
+        "verify", help="[Phase 4] RDAP verification + status-driven drop dates")
+    p_verify.add_argument("--criteria", default="criteria.toml",
+                          help="path to criteria.toml (default: criteria.toml)")
+    p_verify.add_argument("--limit", type=int, default=1000,
+                          help="max candidates to verify this run (default: 1000)")
+    p_verify.add_argument("--concurrency", type=int,
+                          help="override [rdap].concurrency for this run")
+    p_verify.add_argument("--recheck-all", action="store_true", dest="recheck_all",
+                          help="ignore the per-status cadence; re-verify every open+filter_pass row")
+    p_verify.add_argument("--domain", help="verify a single NAME (live debug; writes only to an open row)")
+    p_verify.add_argument("--dry-run", action="store_true",
+                          help="compute + print the tally, write nothing")
+    p_verify.set_defaults(func=commands.cmd_verify)
 
     # outcome carries the dismissal-intent note now; the --dismiss flag lands in Phase 6.
     p_outcome = sub.add_parser(

@@ -29,14 +29,38 @@ def test_init_db_is_idempotent_via_cli(tmp_path):
 
 
 def test_stub_subcommand_reports_phase(capsys):
-    rc = main(["verify"])
+    rc = main(["digest"])          # digest is still a Phase-7 stub
     assert rc == 0
     out = capsys.readouterr().out.lower()
     assert "not implemented" in out
-    assert "phase 4" in out
+    assert "phase 7" in out
 
 
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "whoisfreaks-sample.csv"
+
+
+def test_verify_cli_empty_db_prints_summary(tmp_path, capsys):
+    dbp = tmp_path / "d.db"
+    assert main(["--db", str(dbp), "init-db"]) == 0
+    capsys.readouterr()
+    rc = main(["--db", str(dbp), "verify", "--criteria", str(REPO_ROOT / "criteria.toml")])
+    assert rc == 0
+    out = capsys.readouterr().out.lower()
+    assert "processed=0" in out   # no due rows -> no network
+
+
+def test_verify_cli_dry_run_on_unfiltered_rows_is_network_free(tmp_path, capsys):
+    # rows exist but filter_pass is unset -> select_due excludes them -> no network
+    dbp = tmp_path / "d.db"
+    assert main(["--db", str(dbp), "init-db"]) == 0
+    assert main(["--db", str(dbp), "ingest", "--file", str(FIXTURE),
+                 "--feed-category", "expired",
+                 "--criteria", str(REPO_ROOT / "criteria.toml")]) == 0
+    capsys.readouterr()
+    rc = main(["--db", str(dbp), "verify", "--dry-run",
+               "--criteria", str(REPO_ROOT / "criteria.toml")])
+    assert rc == 0
+    assert "processed=0" in capsys.readouterr().out.lower()
 
 
 def test_ingest_cli_file_creates_rows_and_prints_summary(tmp_path, capsys):
