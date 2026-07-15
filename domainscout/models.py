@@ -53,3 +53,15 @@ class FilterCounts:
     primary: int = 0      # passed & primary track
     secondary: int = 0    # passed & secondary track
     rejected: int = 0
+
+
+@dataclass
+class RdapObservation:
+    """Normalized RDAP result. available=True iff a 404/NotFoundError. status is lowercased;
+    events maps eventAction(lower) -> date; status_json is the rdap_status column value."""
+
+    available: bool
+    status: tuple[str, ...]
+    events: dict
+    expiry_date: date | None
+    status_json: str
