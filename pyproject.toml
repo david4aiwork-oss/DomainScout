@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Personal expired-domain discovery pipeline (.com)"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["httpx", "truststore"]
+dependencies = ["httpx", "truststore", "wordfreq"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
