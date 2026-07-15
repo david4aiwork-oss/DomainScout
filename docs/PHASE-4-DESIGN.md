@@ -1,6 +1,6 @@
 # Phase 4 — RDAP verification: design
 
-**Status:** ✅ **APPROVED 2026-07-15** (brainstorm 2026-07-14 + owner spec review round 1). Ready for
+**Status:** ✅ **BUILT 2026-07-15** (brainstorm 2026-07-14 + owner spec review round 1). Ready for
 writing-plans. Review round 1 landed: dropped-feed rows verify first in `select_due`; `GRACE_EST_DAYS`
 pinned to 45 with a documented hard floor of 35 (self-review number corrected); `pending restore` and
 hold-without-RGP kept OPEN (owner decisions); whodap non-429 exception types verified and wired into the
@@ -437,3 +437,37 @@ python -m domainscout verify [--criteria criteria.toml] [--limit 1000] [--concur
   fixture-tested; async I/O (`lookup_one`, `verify_candidates`, `doh.probe`, `TokenBucket`) is injected into the
   orchestrator so the whole phase tests with zero network; whodap's statefulness is contained by the
   one-client-per-worker pool.
+
+---
+
+## Build notes (2026-07-15)
+
+Built via the 11-task TDD plan (`docs/superpowers/plans/2026-07-15-phase-4-rdap-verification.md`). **141 automated
+tests pass, zero network in the suite** (all RDAP/DoH paths exercised through injected fakes/fixtures), **plus 1
+skipped live smoke** (`test_live_smoke_known_registered_and_available` in `tests/test_rdap.py`, marked
+`@pytest.mark.skip` — run manually against Verisign RDAP).
+
+**Live-smoke confirmation (real-data confirmations #1–#3, run manually 2026-07-15):** `verify --domain` and a seeded
+batch `verify` against `rdap.verisign.com/com/v1/`, through this box's TLS-intercepting proxy via the truststore async
+client — all worked, exactly as designed:
+- `google.com` → `available=False`, status `['client update prohibited', 'client transfer prohibited',
+  'client delete prohibited', 'server update prohibited', 'server transfer prohibited', 'server delete prohibited']`,
+  `lifecycle_status='renewed'` (plainly registered → recovered/closed per row 7), `expiry_date=2028-09-13`,
+  `dns_status='noerror'`.
+- `qzxkvbnmplkjhgfd.com` (unregistered) → `available=True` (RDAP 404), `lifecycle_status='dropped'`,
+  `drop_date_actual` set to today, `dns_status='nxdomain'`.
+- `example.com` → registered, `expiry_date=2026-08-13`, `lifecycle_status='renewed'`, `dns_status='noerror'`.
+- **Seeded batch** (`verify --limit 5` over 2 open `filter_pass=1` rows): summary `processed=2 dropped=1 renewed=1
+  errors=0`; DB writeback correct — the 404 row got `lifecycle_status='dropped'` + `drop_date_actual` set; the
+  registered row got `renewed` + `expiry_date` + `dns_status` + `verified_at`.
+- **`KNOWN_STATUSES` — no additions needed.** Every status string observed on this sample was already in the set;
+  zero entries landed in the unmatched-status tally. A larger real batch (`--limit 25`+ on the live Phase-3
+  backlog) remains the fuller empirical check per the design's confirmation #2, but the sample run surfaced no
+  surprises.
+- TLS-through-MITM works async exactly as it did for Phase-2 ingest — no new truststore issues.
+- **Drop-offset anchoring reality confirmed:** as anticipated in the transition-table notes, Verisign's `events`
+  array did not carry a `redemption period` / `pending delete` phase-start date on the observed responses — it
+  omits RGP phase-start events. So in practice `_drop_after`/`next_state` always fall back to the `today`
+  (observation-date) anchor for `redemption`/`pending_delete`/`grace` estimates, exactly as the design's
+  event-preferred-else-today fallback intended; the event-anchored branch is exercised only by the fixture tests,
+  not yet by a real Verisign response.

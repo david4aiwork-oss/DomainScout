@@ -60,6 +60,38 @@ Phase 3 (rules filter) built and pushed (plan: `docs/superpowers/plans/2026-07-1
 - **Dictionary split-part floor raised ≥2 → ≥3 chars.** `wordfreq` gives 2-letter fragments substantial zipf (`th`=4.2, `ng`=3.9, `aa`=4.01), so a ≥2 floor let consonant-mash clear the dict gate via a bogus split (`thng`→`th`+`ng`, min 3.9 ≥ 3.0). ≥3 kills the noise and loses no genuine multi-word target (real combos use ≥3-char words). Regression-tested.
 - **`pronounce_min_score` = −4.0, a MASH-ONLY gate; "~50–200/day" reclassified as a post-Tier-1 target** (owner decision, revises CLAUDE.md/PHASE-3-DESIGN.md). Calibrated on the 2026-07-11 feed (3,717 candidates): the **dict gate alone passes 472** (>200 already); real expired .coms are overwhelmingly pronounceable (score median −2.94, p5 −4.04), so the pronounceability OR-gate is a wide net; and the trigram model **can't separate borderline invented from borderline mash** (good `zylo` −3.88 = mash `vgkxq` −3.88). Hitting ~200 (floor ≈ −2.2) would reject exactly the invented names the secondary track exists to catch. So −4.0 removes only unambiguous keyboard-mash (`xqzk` −4.23, `qwrtz` −4.11; ~6%), keeps all legitimate invented/geo names, and leaves volume control to the downstream **Tier-1 (Haiku) triage**. Survivors at −4.0: 3,498/day (primary 1,162 / secondary 2,336; 219 rejected). One-line `criteria.toml` tunable; Phase-6 outcome loop can retune. *Revisit trigger:* if Tier-1 cost at ~3.5k/day proves too high, consider a tighter secondary-track floor or lower `zipf_min` rather than one global floor.
 
+### 2026-07-15 — Phase 4 built: RDAP verification
+Phase 4 (RDAP verification) built and pushed (plan: `docs/superpowers/plans/2026-07-15-phase-4-rdap-verification.md`;
+design + build notes: `docs/PHASE-4-DESIGN.md`). `whodap` added as the 4th runtime dependency. 141 tests pass, zero
+network in the suite, plus 1 skipped live smoke (`test_live_smoke_known_registered_and_available`,
+`tests/test_rdap.py`) confirmed manually against real Verisign RDAP. Decisions locked during the brainstorm/build:
+- **`whodap` client, truststore-injected, IANA bootstrap skipped.** Our own truststore `httpx.AsyncClient` (the
+  Phase-2 MITM-handling pattern) is passed into `whodap`; the `.com`→`rdap.verisign.com/com/v1/` mapping is
+  **preset** from `criteria.rdap_endpoint`, so the per-call IANA bootstrap network fetch is never made.
+- **Verify scope = open AND `filter_pass = 1`, dropped-feed-first, capped `--limit 1000`/run.** RDAP calls are
+  spent only on rows that survived Phase 3, ordered dropped-feed-category first (may be hand-registerable *now*),
+  then soonest-drop / stalest-verified; the ~3.5k backlog drains over a few daily runs, truncation logged not silent.
+- **Per-status re-verify cadence** (`pending_delete`=1d, `redemption`=2d, `grace`=7d, `dropped`=7d; `unknown`/missing
+  ⇒ always due) keeps a confirmed drop (404) or a later re-registration (200) from going stale between runs.
+- **`pending restore` and hold-without-RGP kept OPEN** (owner decisions): a filed restore watches one more cadence
+  as `redemption` rather than closing prematurely as `renewed`; a `client hold`/`server hold` with no RGP status
+  classifies as `grace` (OPEN), not a closure — some registrars park expired-in-grace domains on hold before RGP
+  statuses appear, and closing those would forfeit the opportunity window.
+- **DoH is a recorded signal only** (`dns_status` column: `noerror`/`nxdomain`/`servfail`/`error`). NXDOMAIN can't
+  safely mean "available" for .com (redemption/pendingDelete domains leave the zone while still registered), so DoH
+  never gates an RDAP call and never sets `lifecycle_status` — RDAP alone is the source of lifecycle truth.
+- **Drop-date grace anchored on today, with a 35-day hard floor.** `GRACE_EST_DAYS = 45` (low-confidence auto-renew
+  estimate) anchors on the observation date, not the RDAP `expiration` event (which Verisign has already pushed out
+  +1 year during grace); it may never be tuned below **35 days**, the fixed ICANN redemption(30d)+pendingDelete(5d)
+  tail a domain cannot drop faster than. Confirmed empirically at build time: Verisign's `events` array omits RGP
+  phase-start dates on observed responses, so `redemption`/`pending_delete`/`grace` estimates fall back to the
+  `today` anchor in practice (the event-anchored branch exists for forward-compat but wasn't exercised live).
+- **Real-data smoke (2026-07-15):** `google.com` → registered, `renewed`, expiry 2028-09-13; `example.com` →
+  registered, `renewed`, expiry 2026-08-13; `qzxkvbnmplkjhgfd.com` → 404, `dropped`, `drop_date_actual` set to
+  today. Seeded 5-row batch: `processed=2 dropped=1 renewed=1 errors=0`, writeback correct on both rows. Zero
+  entries in the unmatched-status tally — every observed RDAP status string was already in `KNOWN_STATUSES`, so no
+  additions were needed.
+
 ### Accepted defaults (owner didn't object; cheap to change)
 - Daily digest: **local markdown file**, top **10** candidates, Tier-2 scoring cutoff ~**30** domains.
 

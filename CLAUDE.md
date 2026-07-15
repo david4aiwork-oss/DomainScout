@@ -73,7 +73,7 @@ Identity = surrogate `id` PK + partial unique index `UNIQUE(domain) WHERE lifecy
 - [x] Phase 1: skeleton
 - [x] Phase 2: ingestion (WhoisFreaks free feed real; Dynadot = interface stub / Phase 2b)
 - [x] Phase 3: rules filter (wordfreq dict gate + log-space trigram pronounceability; mash-only floor −4.0)
-- [ ] Phase 4: RDAP verification
+- [x] Phase 4: RDAP verification (whodap async, Verisign-direct, status-driven drop dates, re-verify open rows; DoH recorded-signal)
 - [ ] Phase 5: AI scoring
 - [ ] Phase 6: outcomes tracker
 - [ ] Phase 7: daily digest

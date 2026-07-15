@@ -214,3 +214,17 @@ def _const_doh(result="nxdomain"):
     async def _f(domain):
         return result
     return _f
+
+
+import pytest
+
+
+@pytest.mark.skip(reason="live network — run manually against Verisign RDAP")
+def test_live_smoke_known_registered_and_available():
+    from domainscout.config import load_criteria
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    reg, _, _, _ = asyncio.run(rdap.verify_single(crit, "google.com"))
+    assert reg.available is False
+    # a random unlikely-registered label should 404 -> available
+    gone, _, _, _ = asyncio.run(rdap.verify_single(crit, "qzxkvbnmplkjhg.com"))
+    assert gone.available is True
