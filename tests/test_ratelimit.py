@@ -1,6 +1,7 @@
 import asyncio
 
 import httpx
+import pytest
 from whodap.errors import BadStatusCode, MalformedQueryError, NotFoundError, RateLimitError
 
 from domainscout import ratelimit
@@ -70,8 +71,6 @@ def test_with_backoff_does_not_retry_notfound_or_malformed():
             calls.append(1)
             raise _exc
         async def fake_sleep(_): pass
-        try:
+        with pytest.raises(type(exc)):
             asyncio.run(ratelimit.with_backoff(once, retries=5, sleep=fake_sleep))
-        except (NotFoundError, MalformedQueryError):
-            pass
         assert len(calls) == 1  # raised immediately, no retries
