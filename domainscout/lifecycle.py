@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from domainscout.models import RdapObservation
+from domainscout.models import LifecycleUpdate, RdapObservation
 
 REDEMPTION_TAIL_DAYS = 35   # ICANN RGP redemption 30 d + pendingDelete 5 d
 PENDING_DELETE_DAYS = 5
@@ -42,3 +42,31 @@ def _is_due(status: str, verified_at: datetime | None, now: datetime,
     if verified_at is None:
         return True
     return (now - verified_at) >= timedelta(days=recheck_days.get(status, 0))
+
+
+def _drop_after(events: dict, action: str, today: date, offset_days: int) -> date:
+    """Anchor a drop estimate on the RGP phase event date if present, else on today."""
+    base = events.get(action, today)
+    return base + timedelta(days=offset_days)
+
+
+def next_state(current: str, obs: RdapObservation, today: date) -> LifecycleUpdate:
+    """Map (current lifecycle_status, RDAP observation) -> the new cycle state + drop dates.
+    First matching rule wins; see docs/PHASE-4-DESIGN.md transition table."""
+    if obs.available:  # RDAP 404
+        return LifecycleUpdate("dropped", None, today, None)
+
+    st = set(obs.status)
+    if S_PENDING_DELETE in st:
+        est = _drop_after(obs.events, S_PENDING_DELETE, today, PENDING_DELETE_DAYS)
+        return LifecycleUpdate("pending_delete", est, None, obs.expiry_date)
+    if S_REDEMPTION in st or S_PENDING_RESTORE in st:
+        est = _drop_after(obs.events, S_REDEMPTION, today, REDEMPTION_TAIL_DAYS)
+        return LifecycleUpdate("redemption", est, None, obs.expiry_date)
+    if S_AUTO_RENEW in st:
+        return LifecycleUpdate("grace", today + timedelta(days=GRACE_EST_DAYS), None, obs.expiry_date)
+    if current == "dropped":  # was available, now registered (even if on hold) -> re-registered
+        return LifecycleUpdate("reregistered", None, None, obs.expiry_date)
+    if any(h in st for h in S_HOLDS):  # hold + no RGP + not dropped -> mid-expiry-flow park
+        return LifecycleUpdate("grace", today + timedelta(days=GRACE_EST_DAYS), None, obs.expiry_date)
+    return LifecycleUpdate("renewed", None, None, obs.expiry_date)  # plainly registered -> recovered

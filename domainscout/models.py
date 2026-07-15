@@ -65,3 +65,13 @@ class RdapObservation:
     events: dict
     expiry_date: date | None
     status_json: str
+
+
+@dataclass
+class LifecycleUpdate:
+    """Result of applying an RdapObservation to a candidate's current cycle."""
+
+    lifecycle_status: str
+    drop_date_est: date | None
+    drop_date_actual: date | None    # today on a confirmed drop; writer COALESCE-preserves the first
+    expiry_date: date | None
