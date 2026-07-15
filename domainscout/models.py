@@ -42,3 +42,14 @@ class IngestCounts:
     rejected_length: int = 0
     landed: int = 0
     run_date: date | None = None
+
+
+@dataclass
+class FilterCounts:
+    """One filter run's tally (printed summary; per-domain detail lives in filter_reason)."""
+
+    processed: int = 0
+    passed: int = 0
+    primary: int = 0      # passed & primary track
+    secondary: int = 0    # passed & secondary track
+    rejected: int = 0

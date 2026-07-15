@@ -22,7 +22,8 @@ zipf_min = 3.0                    # wordfreq zipf_frequency threshold (tunable)
 combine = "min"                   # two-word split score = min|mean of the parts
 
 [pronounceability]
-min_score = 0.02                  # n-gram floor (tunable; calibrate against outcomes later)
+min_score = -4.0                  # LOG-space mean-log-prob floor; pass if score >= this.
+                                  # PROVISIONAL — recalibrated on a real feed in Phase 3 Task 9.
 
 [scoring]
 tier2_cutoff = 30                 # deep-score top N
