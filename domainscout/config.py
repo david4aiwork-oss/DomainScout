@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,13 @@ class Criteria:
     whoisfreaks: WhoisFreaksConfig | None = None
     primary_allow_invented: bool = True
     dictionary_combine: str = "min"
+    rdap_concurrency: int = 5
+    rdap_max_retries: int = 4
+    rdap_timeout: float = 15.0
+    rdap_user_agent: str = "DomainScout/0.1 (personal expired-domain research)"
+    rdap_recheck_days: dict = field(
+        default_factory=lambda: {"pending_delete": 1, "redemption": 2, "grace": 7, "dropped": 7}
+    )
 
     @property
     def ingest_max_length(self) -> int:
@@ -126,6 +133,20 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
             f"criteria.toml: [dictionary].combine must be 'min' or 'mean', got {combine!r}"
         )
 
+    rdap_tbl = data.get("rdap", {})
+    _DEFAULT_RECHECK = {"pending_delete": 1, "redemption": 2, "grace": 7, "dropped": 7}
+    recheck_tbl = rdap_tbl.get("recheck_days", {})
+    if not isinstance(recheck_tbl, dict):
+        raise ConfigError("criteria.toml: [rdap.recheck_days] must be a table")
+    rdap_recheck_days = {
+        **_DEFAULT_RECHECK,
+        **{str(k): _as_int(v, f"[rdap.recheck_days].{k}") for k, v in recheck_tbl.items()},
+    }
+    rdap_concurrency = _as_int(rdap_tbl.get("concurrency", 5), "[rdap].concurrency")
+    rdap_max_retries = _as_int(rdap_tbl.get("max_retries", 4), "[rdap].max_retries")
+    rdap_timeout = _as_float(rdap_tbl.get("timeout", 15.0), "[rdap].timeout")
+    rdap_user_agent = str(rdap_tbl.get("user_agent", "DomainScout/0.1 (personal expired-domain research)"))
+
     return Criteria(
         tld=tld,
         charset=charset,
@@ -145,4 +166,9 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
         whoisfreaks=whoisfreaks,
         primary_allow_invented=allow_invented,
         dictionary_combine=combine,
+        rdap_concurrency=rdap_concurrency,
+        rdap_max_retries=rdap_max_retries,
+        rdap_timeout=rdap_timeout,
+        rdap_user_agent=rdap_user_agent,
+        rdap_recheck_days=rdap_recheck_days,
     )

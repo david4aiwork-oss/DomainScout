@@ -136,3 +136,51 @@ def test_repo_criteria_toml_is_valid():
     assert crit.ingest_max_length == max(crit.primary_max_length, crit.secondary_max_length)
     assert crit.whoisfreaks is not None
     assert "WhoisFreaks/daily-expired-and-dropped-domains" in crit.whoisfreaks.base_url
+
+
+def test_criteria_has_rdap_defaults(tmp_path):
+    from domainscout.config import load_criteria
+    crit = load_criteria("criteria.toml")
+    assert crit.rdap_concurrency == 5
+    assert crit.rdap_max_retries == 4
+    assert crit.rdap_timeout == 15.0
+    assert "personal expired-domain research" in crit.rdap_user_agent
+    assert crit.rdap_recheck_days["pending_delete"] == 1
+    assert crit.rdap_recheck_days["redemption"] == 2
+    assert crit.rdap_recheck_days["grace"] == 7
+    assert crit.rdap_recheck_days["dropped"] == 7
+    assert "expiring" not in crit.rdap_recheck_days  # dead key removed
+
+
+def test_rdap_recheck_days_defaults_when_table_absent(tmp_path):
+    from domainscout.config import load_criteria
+    toml = tmp_path / "c.toml"
+    # minimal criteria without [rdap.recheck_days]
+    text = '''[ingestion]
+tld = "com"
+charset = "^[a-z]+$"
+sources = ["whoisfreaks"]
+schedule_hint = "late-morning"
+[primary]
+max_length = 8
+max_words = 2
+[secondary]
+min_length = 9
+max_length = 12
+[dictionary]
+zipf_min = 3.0
+[pronounceability]
+min_score = -4.0
+[scoring]
+tier2_cutoff = 30
+digest_top_n = 10
+[rdap]
+endpoint = "https://rdap.verisign.com/com/v1/"
+max_requests_per_sec = 1.0
+[retention]
+days = 360
+'''
+    toml.write_text(text, encoding="utf-8")
+    crit = load_criteria(toml)
+    assert crit.rdap_recheck_days == {"pending_delete": 1, "redemption": 2, "grace": 7, "dropped": 7}
+    assert crit.rdap_concurrency == 5  # default when [rdap].concurrency absent

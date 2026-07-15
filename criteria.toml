@@ -38,6 +38,17 @@ digest_top_n = 10                 # digest shows top N
 [rdap]
 endpoint = "https://rdap.verisign.com/com/v1/"
 max_requests_per_sec = 1.0        # polite default; Verisign publishes no numeric limit
+concurrency = 5                   # simultaneous RDAP lookups (bounded whodap client pool)
+max_retries = 4                   # backoff attempts on 429/5xx/network before -> errors bucket
+timeout = 15.0                    # per-request seconds
+user_agent = "DomainScout/0.1 (personal expired-domain research)"
+
+[rdap.recheck_days]               # per-status re-verify cadence (verified_at staleness, days)
+pending_delete = 1
+redemption = 2                    # also covers pending-restore rows (classified as redemption)
+grace = 7                         # also covers hold-without-RGP rows (classified as grace)
+dropped = 7
+# 'unknown' absent -> always due (0 d); Phase 4 never emits 'expiring' (no key needed)
 
 [retention]
 days = 360                        # raw feeds + digests pruned after this; DB is permanent
