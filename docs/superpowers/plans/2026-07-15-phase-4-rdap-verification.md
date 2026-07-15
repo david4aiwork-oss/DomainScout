@@ -1560,7 +1560,7 @@ Expected: FAIL (currently `verify` prints the stub "not implemented", so `proces
 
 - [ ] **Step 3: Add `cmd_verify` to `commands.py`**
 
-In `domainscout/commands.py`, add `import asyncio` at the top, add `rdap` to the domainscout import:
+In `domainscout/commands.py`, add `import asyncio` at the top, add `from dataclasses import replace`, add `rdap` to the domainscout import:
 ```python
 from domainscout import db, filters, ingest, pronounce, rdap
 ```
@@ -1568,6 +1568,8 @@ Remove `"verify": 4,` from `STUB_PHASES`. Then add:
 ```python
 def cmd_verify(args: argparse.Namespace) -> int:
     criteria = load_criteria(args.criteria)
+    if args.concurrency:
+        criteria = replace(criteria, rdap_concurrency=args.concurrency)  # --concurrency override
     conn = db.connect(args.db)
     try:
         if args.domain:
@@ -1615,7 +1617,7 @@ In `domainscout/__main__.py`, remove the `"verify": ...` line from `_STUB_HELP`.
                           help="compute + print the tally, write nothing")
     p_verify.set_defaults(func=commands.cmd_verify)
 ```
-Note: `--concurrency` is accepted for forward-compat; `run_verify` reads `criteria.rdap_concurrency`. If you want it live now, in `cmd_verify` pass it through by mutating a local — but YAGNI: leave it parsed and unused this phase (documented), or wire it later. (Do NOT add dead behavior; the flag exists so the documented CLI in the design matches.)
+Note: `--concurrency` is wired in `cmd_verify` via `dataclasses.replace(criteria, rdap_concurrency=args.concurrency)` when provided (Step 3); otherwise `run_verify` uses the config default. No dead flag.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
