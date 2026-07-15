@@ -110,3 +110,107 @@ def test_select_due_recheck_all_ignores_cadence(tmp_path):
     dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
     _seed(conn, "fresh.com", lifecycle_status="redemption", verified_at="2026-07-14T12:00:00")
     assert _due_domains(conn, recheck_all=True) == ["fresh.com"]
+
+
+import json as _json
+
+from domainscout.models import RdapObservation, VerifyCounts
+
+
+def _mk_obs(status=(), available=False, expiry=None):
+    return RdapObservation(available=available, status=tuple(status), events={},
+                           expiry_date=expiry, status_json=_json.dumps(list(status)))
+
+
+def _run_verify(conn, mapping, *, limit=1000, dry_run=False, recheck_all=False,
+                now=datetime(2026, 7, 15, 12, 0, 0), doh_result="nxdomain"):
+    async def fake_lookup(label):
+        return mapping[label]
+    async def fake_doh(domain):
+        return doh_result
+    return asyncio.run(rdap.verify_candidates(
+        conn, CRIT, limit=limit, recheck_all=recheck_all, dry_run=dry_run,
+        now=now, lookup=fake_lookup, doh=fake_doh))
+
+
+def test_verify_candidates_writes_rows(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    cid = _seed(conn, "gone.com", feed_category="dropped")
+    counts = _run_verify(conn, {"gone": _mk_obs(available=True)})
+    assert counts.processed == 1 and counts.dropped == 1
+    row = conn.execute("SELECT lifecycle_status, drop_date_actual, dns_status FROM candidates WHERE id=?",
+                       (cid,)).fetchone()
+    assert row["lifecycle_status"] == "dropped"
+    assert row["drop_date_actual"] == "2026-07-15"
+    assert row["dns_status"] == "nxdomain"
+
+
+def test_verify_candidates_dry_run_writes_nothing(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "gone.com")
+    counts = _run_verify(conn, {"gone": _mk_obs(available=True)}, dry_run=True)
+    assert counts.processed == 1
+    row = conn.execute("SELECT lifecycle_status, verified_at FROM candidates WHERE domain='gone.com'").fetchone()
+    assert row["lifecycle_status"] == "unknown" and row["verified_at"] is None
+
+
+def test_verify_candidates_tallies_and_counts_unmatched(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "a.com"); _seed(conn, "b.com")
+    counts = _run_verify(conn, {
+        "a": _mk_obs(status=("redemption period", "surprise status")),
+        "b": _mk_obs(status=("pending delete",)),
+    })
+    assert counts.redemption == 1 and counts.pending_delete == 1
+    assert counts.unmatched == {"surprise status": 1}
+
+
+def test_verify_candidates_error_bucket_does_not_abort(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "ok.com"); _seed(conn, "boom.com")
+
+    async def fake_lookup(label):
+        if label == "boom":
+            raise RuntimeError("network gone")
+        return _mk_obs(available=True)
+    async def fake_doh(domain):
+        return "error"
+    counts = asyncio.run(rdap.verify_candidates(
+        conn, CRIT, limit=1000, recheck_all=False, dry_run=False,
+        now=datetime(2026, 7, 15, 12, 0, 0), lookup=fake_lookup, doh=fake_doh))
+    assert counts.errors == 1 and counts.dropped == 1  # ok.com still processed
+
+
+def test_verify_candidates_limit_sets_left_for_next_run(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    for i in range(3):
+        _seed(conn, f"d{i}.com")
+    counts = _run_verify(conn, {f"d{i}": _mk_obs(available=True) for i in range(3)}, limit=2)
+    assert counts.processed == 2 and counts.left_for_next_run == 1
+
+
+def test_verify_candidates_idempotent_within_cadence(tmp_path):
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "r.com")
+    now1 = datetime(2026, 7, 15, 12, 0, 0)
+    asyncio.run(rdap.verify_candidates(conn, CRIT, limit=1000, recheck_all=False, dry_run=False,
+        now=now1, lookup=_const_lookup(_mk_obs(status=("redemption period",))), doh=_const_doh()))
+    # 1 day later, redemption cadence is 2 days -> not due -> processes nothing
+    now2 = datetime(2026, 7, 16, 12, 0, 0)
+    counts = asyncio.run(rdap.verify_candidates(conn, CRIT, limit=1000, recheck_all=False, dry_run=False,
+        now=now2, lookup=_const_lookup(_mk_obs(available=True)), doh=_const_doh()))
+    assert counts.processed == 0
+    row = conn.execute("SELECT lifecycle_status FROM candidates WHERE domain='r.com'").fetchone()
+    assert row["lifecycle_status"] == "redemption"  # unchanged by the skipped second run
+
+
+def _const_lookup(obs):
+    async def _f(label):
+        return obs
+    return _f
+
+
+def _const_doh(result="nxdomain"):
+    async def _f(domain):
+        return result
+    return _f

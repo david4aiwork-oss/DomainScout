@@ -4,6 +4,7 @@ See docs/PHASE-4-DESIGN.md."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import ssl
 from datetime import date, datetime
@@ -13,8 +14,9 @@ import truststore
 from whodap import DNSClient, DomainResponse
 from whodap.errors import NotFoundError
 
-from domainscout import db, lifecycle
-from domainscout.models import RdapObservation
+from domainscout import db, doh as doh_mod, lifecycle
+from domainscout.models import LifecycleUpdate, RdapObservation, VerifyCounts
+from domainscout.ratelimit import TokenBucket, with_backoff
 
 
 def parse_observation(resp: "DomainResponse | None") -> RdapObservation:
@@ -88,3 +90,110 @@ def select_due(conn, criteria, now: datetime, recheck_all: bool) -> list:
         if lifecycle._is_due(r["lifecycle_status"], va_dt, now, criteria.rdap_recheck_days):
             due.append(r)
     return due
+
+
+def _iso(d) -> "str | None":
+    return d.isoformat() if d is not None else None
+
+
+def _tally(counts: VerifyCounts, status: str) -> None:
+    if hasattr(counts, status):
+        setattr(counts, status, getattr(counts, status) + 1)
+
+
+async def verify_candidates(conn, criteria, *, limit, recheck_all, dry_run, now,
+                            lookup, doh) -> VerifyCounts:
+    """Orchestrate verification over due rows using INJECTED lookup/doh callables (network-free
+    in tests). lookup(label)->RdapObservation; doh(domain)->dns_status. Writes via set_rdap_result."""
+    counts = VerifyCounts()
+    due = select_due(conn, criteria, now, recheck_all)
+    batch = due[:limit] if limit else due
+    counts.left_for_next_run = len(due) - len(batch)
+    today = now.date()
+    now_iso = now.isoformat(timespec="seconds")
+
+    async def handle(row):
+        label = row["domain"][:-4]  # strip ".com"
+        try:
+            obs = await lookup(label)
+        except Exception:
+            counts.errors += 1
+            return
+        dns = await doh(row["domain"])
+        upd = lifecycle.next_state(row["lifecycle_status"], obs, today)
+        counts.processed += 1
+        _tally(counts, upd.lifecycle_status)
+        for s in lifecycle.unmatched_statuses(obs):
+            counts.unmatched[s] = counts.unmatched.get(s, 0) + 1
+        if not dry_run:
+            db.set_rdap_result(
+                conn, row["id"], lifecycle_status=upd.lifecycle_status, rdap_status=obs.status_json,
+                expiry_date=_iso(upd.expiry_date), drop_date_est=_iso(upd.drop_date_est),
+                drop_date_actual=_iso(upd.drop_date_actual), dns_status=dns, verified_at=now_iso,
+            )
+
+    await asyncio.gather(*(handle(r) for r in batch))
+    return counts
+
+
+async def run_verify(conn, criteria, *, limit, recheck_all, dry_run, now=None) -> VerifyCounts:
+    """Real network entry: build the truststore client + a bounded DNSClient pool + rate limiter,
+    then delegate to verify_candidates. The pool (size = rdap_concurrency) is the concurrency bound;
+    the TokenBucket paces to rdap_max_rps; with_backoff retries transient failures."""
+    now = now or datetime.now()
+    http_client = make_async_client(criteria)
+    pool: asyncio.Queue = asyncio.Queue()
+    for _ in range(criteria.rdap_concurrency):
+        pool.put_nowait(_new_dns_client(http_client, criteria.rdap_endpoint))
+    bucket = TokenBucket(criteria.rdap_max_rps)
+
+    async def real_lookup(label):
+        await bucket.acquire()
+        client = await pool.get()
+        try:
+            return await with_backoff(lambda: lookup_one(client, label),
+                                      retries=criteria.rdap_max_retries)
+        finally:
+            pool.put_nowait(client)
+
+    async def real_doh(domain):
+        return await doh_mod.probe(http_client, domain)
+
+    try:
+        return await verify_candidates(conn, criteria, limit=limit, recheck_all=recheck_all,
+                                       dry_run=dry_run, now=now, lookup=real_lookup, doh=real_doh)
+    finally:
+        await http_client.aclose()
+
+
+async def verify_single(criteria, name, *, conn=None, dry_run=False, now=None):
+    """Single-domain debug path (--domain). Live lookup + DoH; writes ONLY when the name has an
+    OPEN row and not dry_run — never onto a closed cycle. Returns (obs, update, dns, wrote)."""
+    now = now or datetime.now()
+    label = name[:-4] if name.endswith(".com") else name
+    domain = f"{label}.com"
+    http_client = make_async_client(criteria)
+    try:
+        client = _new_dns_client(http_client, criteria.rdap_endpoint)
+        obs = await with_backoff(lambda: lookup_one(client, label),
+                                 retries=criteria.rdap_max_retries)
+        dns = await doh_mod.probe(http_client, domain)
+    finally:
+        await http_client.aclose()
+    row = None
+    if conn is not None:
+        row = conn.execute(
+            "SELECT id, lifecycle_status FROM candidates "
+            "WHERE domain=? AND lifecycle_status NOT IN ('renewed','reregistered','dismissed')",
+            (domain,)).fetchone()
+    current = row["lifecycle_status"] if row else "unknown"
+    upd = lifecycle.next_state(current, obs, now.date())
+    wrote = False
+    if row is not None and not dry_run:
+        db.set_rdap_result(
+            conn, row["id"], lifecycle_status=upd.lifecycle_status, rdap_status=obs.status_json,
+            expiry_date=_iso(upd.expiry_date), drop_date_est=_iso(upd.drop_date_est),
+            drop_date_actual=_iso(upd.drop_date_actual), dns_status=dns,
+            verified_at=now.isoformat(timespec="seconds"))
+        wrote = True
+    return obs, upd, dns, wrote

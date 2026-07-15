@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 # Lifecycle status is the single source of truth for whether a cycle is OPEN.
@@ -75,3 +75,19 @@ class LifecycleUpdate:
     drop_date_est: date | None
     drop_date_actual: date | None    # today on a confirmed drop; writer COALESCE-preserves the first
     expiry_date: date | None
+
+
+@dataclass
+class VerifyCounts:
+    """One verify run's tally (printed summary)."""
+
+    processed: int = 0
+    dropped: int = 0
+    redemption: int = 0
+    pending_delete: int = 0
+    grace: int = 0
+    renewed: int = 0
+    reregistered: int = 0
+    errors: int = 0
+    left_for_next_run: int = 0
+    unmatched: dict = field(default_factory=dict)
