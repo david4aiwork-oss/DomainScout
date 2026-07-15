@@ -1,7 +1,24 @@
 # Phase 2 — Ingestion: design
 
-**Status:** 📝 **DRAFT — pending owner approval (2026-07-14).** Brainstormed via superpowers; supersedes nothing.
+**Status:** ✅ **BUILT 2026-07-14.** Implemented per docs/superpowers/plans/2026-07-14-phase-2-ingestion.md
+(feed confirmed live: single-column plain-text names, `main` branch). See **Build notes** below for two
+amendments surfaced during the real-data smoke test.
 Parent design: `docs/TECHNICAL-DESIGN.md` §4.1 (module boundaries), §4.2 (ingestion + hard gate), §5 (schema).
+
+## Build notes (2026-07-14)
+
+- **TLS trust — added `truststore` (2nd runtime dep).** This Windows box intercepts HTTPS with a private root
+  CA (AV/proxy) trusted by the OS store but absent from `certifi`, so httpx's default verification failed
+  (`CERTIFICATE_VERIFY_FAILED`). Fix (owner-approved): `ingest.make_client()` builds the httpx client with a
+  `truststore.SSLContext`, verifying against the **OS trust store**. Portable — Windows store here, system CA
+  store on a future Linux VPS. Tests are unaffected (they inject `httpx.MockTransport`, no real TLS).
+- **Feed lag is ~3 days, not ~1.** On 2026-07-14 the newest dated file at the repo root was `2026-07-11`
+  (`0-latest-*` always exists; older dated files rotate into `archive/`). The `ingest` default of "yesterday"
+  will often 404 during the lag window — handled gracefully (warning + skip, exit 0). The cron `--date`
+  should target a few days back, or a follow-up could add a `--latest` mode. Recorded for Phase 2 scheduling.
+- **Real-data sanity (2026-07-11, 10k names/file):** expired → landed 1718 (tld 5700 / charset 958 / length 1624);
+  dropped → landed 1999 (tld 4860 / charset 1017 / length 2124). `tld` dominates (~50–57 %, matching ~40–45 %
+  .com). Idempotent re-run: candidates 3717 → 3717, ingest_log stays 2 rows, downloads skipped.
 
 **Goal:** Turn the WhoisFreaks free feed into gated `candidates` rows on an idempotent daily run — download →
 hard-invariant gate → open-cycle upsert → per-run `ingest_log` counts — reusing the Phase-1 DB helpers. Lock a shared

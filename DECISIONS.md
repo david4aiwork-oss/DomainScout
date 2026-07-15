@@ -49,6 +49,12 @@ Owner reviewed the TDD a second time, ratified the three open items, and raised 
 - **`wordfreq` is frozen at 2024** (author stopped updating; LLM-corpus pollution) — emerging vocab won't register; that's the Tier-2 Google-Trends context's job, not the Phase-3 dictionary gate's.
 - **Google Safe Browsing** needs a free-tier Google Cloud API key → added to the credentials/`.env` signup list.
 
+### 2026-07-14 — Phase 2 built: ingestion + `truststore` TLS
+Phase 2 (ingestion) built and pushed (plan: `docs/superpowers/plans/2026-07-14-phase-2-ingestion.md`; design/build notes: `docs/PHASE-2-DESIGN.md`). WhoisFreaks free feed is real end-to-end; Dynadot is an interface stub deferred to a "Phase 2b" spec (its public data is an auction CSV with a different schema). Two decisions landed during the build:
+- **`truststore` added as a 2nd runtime dependency** (owner-approved). This Windows machine intercepts HTTPS with a private root CA (AV/proxy) trusted by the OS store but absent from `certifi`, so httpx's default verification failed (`CERTIFICATE_VERIFY_FAILED`). `ingest.make_client()` now verifies against the **OS trust store** via `truststore.SSLContext`. Secure (not `verify=False`), portable (Windows store now, Linux system CA store on the VPS), zero cost. Tests unaffected (mock transport, no real TLS).
+- **Feed lag is ~3 days, not ~1** (empirical): on 2026-07-14 the newest dated file at the repo root was `2026-07-11` (older dates rotate into `archive/`; `0-latest-*` always present). The `ingest` "yesterday" default will often 404 during the window — handled as warning + skip (exit 0). Cron `--date` should target a few days back (or add a `--latest` mode later). Supersedes the "~1-day lag" note under review-round-2 cron timing for scheduling purposes.
+- **Real-data smoke (2026-07-11, 10k names/file):** expired landed 1718, dropped landed 1999; `tld` reject bucket ~50–57% (consistent with ~40–45% .com); idempotent re-run stable (candidates 3717→3717, ingest_log 2 rows).
+
 ### Accepted defaults (owner didn't object; cheap to change)
 - Daily digest: **local markdown file**, top **10** candidates, Tier-2 scoring cutoff ~**30** domains.
 
