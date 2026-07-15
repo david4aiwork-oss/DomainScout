@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   lifecycle_status   TEXT NOT NULL DEFAULT 'unknown',
   rdap_status        TEXT,
   verified_at        TIMESTAMP,
+  dns_status         TEXT,
   filter_pass        BOOLEAN,
   filter_reason      TEXT,
   track              TEXT,
@@ -75,6 +76,7 @@ _MIGRATION_COLUMNS = [
     ("dict_score", "REAL"),
     ("pronounce_score", "REAL"),
     ("filtered_at", "TIMESTAMP"),
+    ("dns_status", "TEXT"),
 ]
 
 
@@ -158,6 +160,38 @@ def set_filter_result(
         """,
         (track, dict_score, pronounce_score, 1 if filter_pass else 0,
          filter_reason, stamp, candidate_id),
+    )
+    conn.commit()
+
+
+def set_rdap_result(
+    conn: sqlite3.Connection,
+    candidate_id: int,
+    *,
+    lifecycle_status: str,
+    rdap_status: str,
+    expiry_date: str | None,
+    drop_date_est: str | None,
+    drop_date_actual: str | None,
+    dns_status: str | None,
+    verified_at: str,
+) -> None:
+    """Write the RDAP/DoH columns for one candidate. drop_date_actual is COALESCE-preserved
+    (first confirmed drop sticks); touches nothing else (never filter_*/scoring/source/first_seen)."""
+    conn.execute(
+        """
+        UPDATE candidates
+           SET lifecycle_status = ?,
+               rdap_status = ?,
+               expiry_date = ?,
+               drop_date_est = ?,
+               drop_date_actual = COALESCE(drop_date_actual, ?),
+               dns_status = ?,
+               verified_at = ?
+         WHERE id = ?
+        """,
+        (lifecycle_status, rdap_status, expiry_date, drop_date_est, drop_date_actual,
+         dns_status, verified_at, candidate_id),
     )
     conn.commit()
 

@@ -185,3 +185,72 @@ def test_record_ingest_is_idempotent_per_file(tmp_path):
     rows = conn.execute("SELECT landed FROM ingest_log").fetchall()
     assert len(rows) == 1
     assert rows[0]["landed"] == 55
+
+
+def test_init_db_adds_dns_status_to_existing_db(tmp_path):
+    import re
+    dbp = tmp_path / "d.db"
+    # simulate a pre-Phase-4 DB: shipped schema minus dns_status
+    old_schema = re.sub(r"\n[^\n]*\bdns_status\b[^\n]*,", "", db.SCHEMA, count=1)
+    conn = sqlite3.connect(dbp)
+    conn.executescript(old_schema)
+    conn.commit()
+    pre = {r[1] for r in conn.execute("PRAGMA table_info(candidates)")}
+    conn.close()
+    assert "dns_status" not in pre
+    db.init_db(dbp)  # must migrate
+    conn = db.connect(dbp)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)")}
+    assert "dns_status" in cols
+
+
+def test_set_rdap_result_writes_fields(tmp_path):
+    dbp = tmp_path / "d.db"
+    db.init_db(dbp)
+    conn = db.connect(dbp)
+    cid = db.upsert_candidate(conn, Candidate(domain="foo.com", source="whoisfreaks"))
+    db.set_rdap_result(
+        conn, cid, lifecycle_status="redemption", rdap_status='["redemption period"]',
+        expiry_date="2026-06-01", drop_date_est="2026-08-19", drop_date_actual=None,
+        dns_status="nxdomain", verified_at="2026-07-15T10:00:00",
+    )
+    row = conn.execute(
+        "SELECT lifecycle_status, rdap_status, expiry_date, drop_date_est, "
+        "drop_date_actual, dns_status, verified_at FROM candidates WHERE id=?", (cid,)
+    ).fetchone()
+    assert row["lifecycle_status"] == "redemption"
+    assert row["rdap_status"] == '["redemption period"]'
+    assert row["drop_date_est"] == "2026-08-19"
+    assert row["drop_date_actual"] is None
+    assert row["dns_status"] == "nxdomain"
+    assert row["verified_at"] == "2026-07-15T10:00:00"
+
+
+def test_set_rdap_result_coalesces_first_drop_date(tmp_path):
+    dbp = tmp_path / "d.db"
+    db.init_db(dbp)
+    conn = db.connect(dbp)
+    cid = db.upsert_candidate(conn, Candidate(domain="foo.com", source="whoisfreaks"))
+    db.set_rdap_result(conn, cid, lifecycle_status="dropped", rdap_status="[]",
+                       expiry_date=None, drop_date_est=None, drop_date_actual="2026-07-15",
+                       dns_status="nxdomain", verified_at="2026-07-15T10:00:00")
+    # a later confirm passes a different actual -> must NOT overwrite the first
+    db.set_rdap_result(conn, cid, lifecycle_status="dropped", rdap_status="[]",
+                       expiry_date=None, drop_date_est=None, drop_date_actual="2026-07-22",
+                       dns_status="nxdomain", verified_at="2026-07-22T10:00:00")
+    row = conn.execute("SELECT drop_date_actual FROM candidates WHERE id=?", (cid,)).fetchone()
+    assert row["drop_date_actual"] == "2026-07-15"  # first one sticks
+
+
+def test_set_rdap_result_leaves_filter_columns_untouched(tmp_path):
+    dbp = tmp_path / "d.db"
+    db.init_db(dbp)
+    conn = db.connect(dbp)
+    cid = db.upsert_candidate(conn, Candidate(domain="foo.com", source="whoisfreaks"))
+    db.set_filter_result(conn, cid, track="primary", dict_score=3.4, pronounce_score=-2.1,
+                         filter_pass=True, filter_reason="primary dict=3.40 foo")
+    db.set_rdap_result(conn, cid, lifecycle_status="grace", rdap_status="[]",
+                       expiry_date=None, drop_date_est="2026-08-29", drop_date_actual=None,
+                       dns_status="noerror", verified_at="2026-07-15T10:00:00")
+    row = conn.execute("SELECT track, dict_score, filter_pass FROM candidates WHERE id=?", (cid,)).fetchone()
+    assert row["track"] == "primary" and row["dict_score"] == 3.4 and row["filter_pass"] == 1
