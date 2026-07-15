@@ -226,5 +226,5 @@ def test_live_smoke_known_registered_and_available():
     reg, _, _, _ = asyncio.run(rdap.verify_single(crit, "google.com"))
     assert reg.available is False
     # a random unlikely-registered label should 404 -> available
-    gone, _, _, _ = asyncio.run(rdap.verify_single(crit, "qzxkvbnmplkjhg.com"))
+    gone, _, _, _ = asyncio.run(rdap.verify_single(crit, "qzxkvbnmplkjhgfd.com"))
     assert gone.available is True

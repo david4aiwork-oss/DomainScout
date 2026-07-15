@@ -1,7 +1,7 @@
 # Phase 4 — RDAP verification: design
 
-**Status:** ✅ **BUILT 2026-07-15** (brainstorm 2026-07-14 + owner spec review round 1). Ready for
-writing-plans. Review round 1 landed: dropped-feed rows verify first in `select_due`; `GRACE_EST_DAYS`
+**Status:** ✅ **BUILT 2026-07-15** (brainstorm 2026-07-14 + owner spec review round 1 → 11-task TDD
+plan → subagent-driven build; see Build notes at end). Review round 1 landed: dropped-feed rows verify first in `select_due`; `GRACE_EST_DAYS`
 pinned to 45 with a documented hard floor of 35 (self-review number corrected); `pending restore` and
 hold-without-RGP kept OPEN (owner decisions); whodap non-429 exception types verified and wired into the
 backoff retry set; dead `[rdap.recheck_days] expiring` key removed; unmatched-status tally added; `--domain`
