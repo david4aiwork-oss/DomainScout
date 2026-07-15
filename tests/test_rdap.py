@@ -181,6 +181,26 @@ def test_verify_candidates_error_bucket_does_not_abort(tmp_path):
     assert counts.errors == 1 and counts.dropped == 1  # ok.com still processed
 
 
+def test_verify_candidates_post_lookup_error_bucketed(tmp_path):
+    # an exception AFTER the lookup (here: doh) must bucket that row as an error
+    # and NOT abort the batch; other rows still process.
+    dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
+    _seed(conn, "ok.com"); _seed(conn, "boom.com")
+    async def fake_lookup(label):
+        return _mk_obs(available=True)
+    async def fake_doh(domain):
+        if domain == "boom.com":
+            raise RuntimeError("post-lookup boom")
+        return "nxdomain"
+    counts = asyncio.run(rdap.verify_candidates(
+        conn, CRIT, limit=1000, recheck_all=False, dry_run=False,
+        now=datetime(2026, 7, 15, 12, 0, 0), lookup=fake_lookup, doh=fake_doh))
+    assert counts.errors == 1
+    assert counts.processed == 1 and counts.dropped == 1  # ok.com still written
+    row = conn.execute("SELECT lifecycle_status FROM candidates WHERE domain='boom.com'").fetchone()
+    assert row["lifecycle_status"] == "unknown"  # boom.com not written
+
+
 def test_verify_candidates_limit_sets_left_for_next_run(tmp_path):
     dbp = tmp_path / "d.db"; db.init_db(dbp); conn = db.connect(dbp)
     for i in range(3):

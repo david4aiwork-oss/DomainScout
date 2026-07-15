@@ -110,3 +110,11 @@ def test_drop_offset_prefers_event_date_when_present():
     obs = _obs(status=("redemption period",), events={"redemption period": date(2026, 7, 10)})
     upd = lifecycle.next_state("unknown", obs, TODAY)
     assert upd.drop_date_est == date(2026, 8, 14)  # 2026-07-10 + 35, not today + 35
+
+
+def test_drop_after_handles_null_event_date():
+    # an RGP event present with a null eventDate must fall back to today, not crash
+    obs = _obs(status=("redemption period",), events={"redemption period": None})
+    upd = lifecycle.next_state("unknown", obs, TODAY)
+    assert upd.lifecycle_status == "redemption"
+    assert upd.drop_date_est == date(2026, 8, 19)  # TODAY + 35, not a TypeError

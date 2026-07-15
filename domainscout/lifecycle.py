@@ -46,7 +46,7 @@ def _is_due(status: str, verified_at: datetime | None, now: datetime,
 
 def _drop_after(events: dict, action: str, today: date, offset_days: int) -> date:
     """Anchor a drop estimate on the RGP phase event date if present, else on today."""
-    base = events.get(action, today)
+    base = events.get(action) or today
     return base + timedelta(days=offset_days)
 
 

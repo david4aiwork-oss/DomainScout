@@ -113,24 +113,23 @@ async def verify_candidates(conn, criteria, *, limit, recheck_all, dry_run, now,
     now_iso = now.isoformat(timespec="seconds")
 
     async def handle(row):
-        label = row["domain"][:-4]  # strip ".com"
         try:
+            label = row["domain"][:-4]  # strip ".com"
             obs = await lookup(label)
+            dns = await doh(row["domain"])
+            upd = lifecycle.next_state(row["lifecycle_status"], obs, today)
+            if not dry_run:
+                db.set_rdap_result(
+                    conn, row["id"], lifecycle_status=upd.lifecycle_status, rdap_status=obs.status_json,
+                    expiry_date=_iso(upd.expiry_date), drop_date_est=_iso(upd.drop_date_est),
+                    drop_date_actual=_iso(upd.drop_date_actual), dns_status=dns, verified_at=now_iso,
+                )
+            counts.processed += 1
+            _tally(counts, upd.lifecycle_status)
+            for s in lifecycle.unmatched_statuses(obs):
+                counts.unmatched[s] = counts.unmatched.get(s, 0) + 1
         except Exception:
             counts.errors += 1
-            return
-        dns = await doh(row["domain"])
-        upd = lifecycle.next_state(row["lifecycle_status"], obs, today)
-        counts.processed += 1
-        _tally(counts, upd.lifecycle_status)
-        for s in lifecycle.unmatched_statuses(obs):
-            counts.unmatched[s] = counts.unmatched.get(s, 0) + 1
-        if not dry_run:
-            db.set_rdap_result(
-                conn, row["id"], lifecycle_status=upd.lifecycle_status, rdap_status=obs.status_json,
-                expiry_date=_iso(upd.expiry_date), drop_date_est=_iso(upd.drop_date_est),
-                drop_date_actual=_iso(upd.drop_date_actual), dns_status=dns, verified_at=now_iso,
-            )
 
     await asyncio.gather(*(handle(r) for r in batch))
     return counts
