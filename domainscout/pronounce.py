@@ -8,6 +8,7 @@ load. No network at scoring time."""
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date
 from pathlib import Path
@@ -62,3 +63,44 @@ def save_tables(tables: dict, path: str | Path) -> None:
         json.dumps(tables, sort_keys=True, ensure_ascii=True, separators=(",", ":")),
         encoding="utf-8",
     )
+
+
+class Model:
+    """Add-one smoothed trigram log-probabilities over the built counts."""
+
+    def __init__(self, trigram_counts: dict[str, int], context2_totals: dict[str, int]) -> None:
+        self._tri = trigram_counts
+        self._ctx = context2_totals
+
+    @classmethod
+    def from_tables(cls, tables: dict) -> "Model":
+        return cls(tables["trigram_counts"], tables["context2_totals"])
+
+    def logp(self, trigram: str) -> float:
+        num = self._tri.get(trigram, 0) + 1
+        den = self._ctx.get(trigram[:2], 0) + V
+        return math.log(num / den)
+
+
+def load_tables(path: str | Path = DEFAULT_TABLES_PATH) -> Model:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return Model.from_tables(data)
+
+
+_DEFAULT_MODEL: Model | None = None
+
+
+def default_model() -> Model:
+    global _DEFAULT_MODEL
+    if _DEFAULT_MODEL is None:
+        _DEFAULT_MODEL = load_tables()
+    return _DEFAULT_MODEL
+
+
+def score(label: str, model: Model | None = None) -> float:
+    """Mean log P(c3|c1c2) over the boundary-padded trigrams of the label.
+    Log space => always <= 0, finite (smoothing). Trigram-uniform for all lengths."""
+    m = model if model is not None else default_model()
+    padded = f"^^{label}$"
+    trigrams = [padded[i:i + 3] for i in range(len(padded) - 2)]
+    return sum(m.logp(t) for t in trigrams) / len(trigrams)

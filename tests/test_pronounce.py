@@ -1,6 +1,18 @@
 import json
+import math
+
+import pytest
 
 from domainscout import pronounce
+
+# an English-ish training vocab that makes '-and'/'br-' patterns common
+FIXTURE_WORDS = ["brand", "brandy", "band", "land", "sand", "hand", "grand",
+                 "stand", "bland", "brain", "bread", "break", "brown"]
+
+
+@pytest.fixture
+def model():
+    return pronounce.Model.from_tables(pronounce.build_tables(words=FIXTURE_WORDS))
 
 
 def test_build_tables_counts_and_padding():
@@ -27,3 +39,21 @@ def test_save_tables_is_sorted_and_loadable(tmp_path):
     assert loaded["trigram_counts"]["fox"] == 1
     # sorted keys => "context2_totals" appears before "trigram_counts"
     assert raw.index('"context2_totals"') < raw.index('"trigram_counts"')
+
+
+def test_score_orders_realish_above_mash(model):
+    assert pronounce.score("brand", model) > pronounce.score("xqzk", model)
+    assert pronounce.score("bland", model) > pronounce.score("xqzk", model)
+
+
+def test_score_smoothing_is_finite(model):
+    s = pronounce.score("xqzk", model)  # all-unseen trigrams
+    assert math.isfinite(s)             # add-one => never -inf
+
+
+def test_score_scale_contract(model):
+    # pins the SPACE: every score finite, log-space bound (<= 0), and monotonic
+    labels = ["brand", "bland", "xqzk"]
+    scores = [pronounce.score(x, model) for x in labels]
+    assert all(math.isfinite(s) and s <= 0.0 for s in scores)
+    assert scores[0] >= scores[1] >= scores[2]
