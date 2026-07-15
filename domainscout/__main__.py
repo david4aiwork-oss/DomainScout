@@ -9,7 +9,6 @@ from domainscout import __version__, commands
 from domainscout.db import DEFAULT_DB_PATH
 
 _STUB_HELP = {
-    "filter": "[Phase 3] deterministic rules filter (dictionary + pronounceability)",
     "verify": "[Phase 4] RDAP verification and status-driven drop dates",
     "score-submit": "[Phase 5] submit the AI scoring batch",
     "score-collect": "[Phase 5] collect AI scoring batch results",
@@ -45,6 +44,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--dry-run", action="store_true",
                           help="gate + print counts, write nothing")
     p_ingest.set_defaults(func=commands.cmd_ingest)
+
+    p_filter = sub.add_parser(
+        "filter", help="[Phase 3] classify + dictionary/pronounceability gates on candidates")
+    p_filter.add_argument("--criteria", default="criteria.toml",
+                          help="path to criteria.toml (default: criteria.toml)")
+    p_filter.add_argument("--recompute", action="store_true",
+                          help="re-filter all open rows (after tuning thresholds)")
+    p_filter.add_argument("--limit", type=int, help="max candidates to process")
+    p_filter.add_argument("--dry-run", action="store_true",
+                          help="compute + print summary, write nothing")
+    p_filter.set_defaults(func=commands.cmd_filter)
+
+    p_ngrams = sub.add_parser(
+        "build-ngrams", help="[Phase 3] (re)build the pronounceability n-gram tables")
+    p_ngrams.add_argument("--top-n", type=int, default=50000, dest="top_n",
+                          help="number of top English words to train on (default: 50000)")
+    p_ngrams.add_argument("--out", help="output path (default: domainscout/pronounce_tables.json)")
+    p_ngrams.set_defaults(func=commands.cmd_build_ngrams)
 
     # outcome carries the dismissal-intent note now; the --dismiss flag lands in Phase 6.
     p_outcome = sub.add_parser(

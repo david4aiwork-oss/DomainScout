@@ -7,12 +7,11 @@ import argparse
 from datetime import date, timedelta
 from pathlib import Path
 
-from domainscout import db, ingest
+from domainscout import db, filters, ingest, pronounce
 from domainscout.config import load_criteria
 
 # Subcommand -> the phase number that will implement it.
 STUB_PHASES: dict[str, int] = {
-    "filter": 3,
     "verify": 4,
     "score-submit": 5,
     "score-collect": 5,
@@ -62,4 +61,32 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             print(ingest.summary_line(counts))
     finally:
         conn.close()
+    return 0
+
+
+def cmd_filter(args: argparse.Namespace) -> int:
+    criteria = load_criteria(args.criteria)
+    conn = db.connect(args.db)
+    try:
+        counts = filters.filter_candidates(
+            conn, criteria, recompute=args.recompute, limit=args.limit,
+            dry_run=args.dry_run,
+        )
+    finally:
+        conn.close()
+    print(
+        f"filter: processed={counts.processed} passed={counts.passed} "
+        f"(primary={counts.primary} secondary={counts.secondary}) "
+        f"rejected={counts.rejected}"
+        + ("  [dry-run]" if args.dry_run else "")
+    )
+    return 0
+
+
+def cmd_build_ngrams(args: argparse.Namespace) -> int:
+    out = Path(args.out) if args.out else pronounce.DEFAULT_TABLES_PATH
+    tables = pronounce.build_tables(top_n=args.top_n)
+    pronounce.save_tables(tables, out)
+    size_kb = out.stat().st_size / 1024
+    print(f"build-ngrams: wrote {out} ({size_kb:.0f} KB, {tables['_meta']['words_kept']} words)")
     return 0
