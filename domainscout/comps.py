@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import csv
 import hashlib
-import httpx
 import json
 import logging
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+
+import httpx
 
 from domainscout import filters
 from domainscout.models import CompsContext, FileRefreshResult, KeywordComps, RefreshResult
@@ -395,10 +396,19 @@ def refresh_one(client, spec: FileSpec, criteria, data_dir: Path, meta: dict, *,
         log.warning("comps: %s refused - %s; cache left intact", spec.name, reason)
         return FileRefreshResult(spec.name, "refused", reason)
 
-    rows, sha = _count_rows(tmp), _sha256(tmp)
-    if current.is_file():
-        current.replace(prev)      # atomic; keeps exactly ONE predecessor
-    tmp.replace(current)           # atomic
+    try:
+        rows, sha = _count_rows(tmp), _sha256(tmp)
+        if current.is_file():
+            current.replace(prev)      # atomic; keeps exactly ONE predecessor
+        tmp.replace(current)           # atomic
+    except OSError as exc:
+        # A lock/IO error mid-swap (e.g. AV holding the file on Windows) must not
+        # abort the sibling file's refresh or lose its meta. Refuse THIS file only;
+        # if current was already moved to .prev, resolve_cache_path recovers on read.
+        tmp.unlink(missing_ok=True)
+        log.warning("comps: %s swap failed - %s; cache left at .prev if mid-swap "
+                    "(resolve_cache_path recovers on read)", spec.name, exc)
+        return FileRefreshResult(spec.name, "refused", f"swap failed: {exc}")
     meta[spec.name] = {"retrieved": now.isoformat(), "rows": rows,
                        "sha256": sha, "bytes": nbytes}
     return FileRefreshResult(spec.name, "swapped", "", rows=rows, bytes=nbytes)

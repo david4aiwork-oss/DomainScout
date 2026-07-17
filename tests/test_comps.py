@@ -350,3 +350,21 @@ def test_force_never_bypasses_header_check(tmp_path):
     res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW, force=True)
     by = {f.name: f for f in res.files}
     assert by["retailstats"].action == "refused" and "header" in by["retailstats"].reason
+
+
+def test_refresh_swap_oserror_is_isolated_to_one_file(tmp_path, monkeypatch):
+    """A swap-time OSError (e.g. AV file lock on Windows) on retailstats must NOT
+    abort tldstats or raise out of refresh_cache — it refuses only the affected file."""
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (200, _good(TLD))})
+    real_sha = comps._sha256
+    def flaky_sha(path):
+        if "retailstats" in str(path):
+            raise OSError("simulated AV lock")
+        return real_sha(path)
+    monkeypatch.setattr(comps, "_sha256", flaky_sha)
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)   # must NOT raise
+    by = {f.name: f for f in res.files}
+    assert by["retailstats"].action == "refused" and "swap failed" in by["retailstats"].reason
+    assert by["tldstats"].action == "swapped"          # sibling unaffected
+    assert (tmp_path / "namebio_tldstats.csv").is_file()
