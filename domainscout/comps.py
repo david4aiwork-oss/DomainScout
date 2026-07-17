@@ -11,8 +11,11 @@ Read docs/PHASE-5A-DESIGN.md "NameBio gotchas" before touching the refresh path.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import logging
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 from domainscout import filters
@@ -34,6 +37,112 @@ PLACEMENTS = ("exact", "start", "end", "middle")
 
 class CompsCacheMissing(FileNotFoundError):
     """No comps cache (and no .prev) — run `domainscout comps-refresh`."""
+
+
+log = logging.getLogger(__name__)
+
+META_FILENAME = "namebio_meta.json"
+
+
+def load_meta(data_dir: str | Path) -> dict:
+    """Per-file {retrieved, rows, sha256, bytes}. Missing/corrupt -> {} so refresh falls back
+    to first-run rules and load still works (the sidecar is an optimisation + audit record,
+    never a hard dependency for READING the cache)."""
+    p = Path(data_dir) / META_FILENAME
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        log.warning("comps: %s is unreadable/corrupt; treating caches as stale", p)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_meta(data_dir: str | Path, meta: dict) -> None:
+    """Atomic tmp+rename so a crash can't leave a half-written sidecar."""
+    d = Path(data_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / (META_FILENAME + ".tmp")
+    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(d / META_FILENAME)
+
+
+def _count_rows(path: Path) -> int:
+    with path.open("rb") as fh:
+        return max(0, sum(1 for _ in fh) - 1)  # minus header
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_download(tmp_path, *, expected_header, baseline_rows, min_rows,
+                      shrink_tolerance) -> tuple[bool, str]:
+    """Gate a downloaded file BEFORE it replaces a good cache.
+
+    Atomic rename guarantees a COMPLETE file, not a GOOD one: HTTP 200 with an
+    error-page-as-CSV, an empty body, or a truncated export would all atomically install
+    garbage. Returns (ok, reason); reason is '' on success."""
+    p = Path(tmp_path)
+    if not p.is_file():
+        return False, "download missing"
+    try:
+        with p.open("r", encoding="utf-8", newline="") as fh:
+            first = fh.readline().rstrip("\n").rstrip("\r")
+    except OSError as exc:
+        return False, f"unreadable: {exc}"
+    if not first:
+        return False, "empty file"
+    try:
+        header = tuple(next(csv.reader([first])))
+    except csv.Error as exc:
+        return False, f"does not parse as CSV: {exc}"
+    if header != tuple(expected_header):
+        return False, (
+            f"header mismatch (got {header[0]!r}, {len(header)} cols; "
+            f"expected {len(expected_header)}) - NameBio may have changed the schema"
+        )
+    rows = _count_rows(p)
+    if baseline_rows:
+        floor = int(baseline_rows * shrink_tolerance)
+        if rows < floor:
+            return False, f"shrink: {rows} rows < {floor} ({shrink_tolerance:.0%} of {baseline_rows})"
+    elif rows < min_rows:
+        return False, f"below min_rows floor: {rows} < {min_rows}"
+    return True, ""
+
+
+def resolve_cache_path(current: Path, prev: Path) -> tuple[Path, bool]:
+    """(path_to_load, used_prev). `current -> .prev` and `tmp -> current` are each atomic but
+    NOT jointly atomic: a crash between them leaves no current file. Fall back loudly."""
+    current, prev = Path(current), Path(prev)
+    if current.is_file():
+        return current, False
+    if prev.is_file():
+        log.warning(
+            "comps cache %s missing but %s exists - loading .prev (crash between swap "
+            "renames?); run `domainscout comps-refresh --force` to repair",
+            current.name, prev.name,
+        )
+        return prev, True
+    raise CompsCacheMissing(
+        f"no comps cache at {current} or {prev}; run `domainscout comps-refresh`")
+
+
+def cache_age_days(meta: dict, name: str, now: datetime) -> float | None:
+    """Age in days from the sidecar's `retrieved`; None if unknown."""
+    stamp = (meta.get(name) or {}).get("retrieved")
+    if not stamp:
+        return None
+    try:
+        return (now - datetime.fromisoformat(stamp)).total_seconds() / 86400.0
+    except (TypeError, ValueError):
+        return None
 
 
 def load_index(path: str | Path) -> dict[str, str]:

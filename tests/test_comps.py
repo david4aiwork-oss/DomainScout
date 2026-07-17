@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -117,3 +118,89 @@ def test_lookup_surfaces_whole_label_compound_as_exact():
     assert ctx.exact is not None
     assert ctx.exact.keyword == "cloudvault" and ctx.exact.placement == "exact"
     assert ctx.exact.sale_count == 3
+
+
+def _write(p: Path, header, rows):
+    p.write_text(",".join(header) + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
+
+
+def test_validate_download_accepts_good_file(tmp_path):
+    ok, reason = comps.validate_download(
+        RETAIL, expected_header=comps.RETAILSTATS_HEADER, baseline_rows=5,
+        min_rows=1, shrink_tolerance=0.8)
+    assert ok is True and reason == ""
+
+
+def test_validate_download_rejects_error_page(tmp_path):
+    """HTTP 200 + an HTML error page is the exact failure atomic rename does NOT cover."""
+    p = tmp_path / "bad.csv"
+    p.write_text("<html><body>rate limited</body></html>", encoding="utf-8")
+    ok, reason = comps.validate_download(
+        p, expected_header=comps.RETAILSTATS_HEADER, baseline_rows=5,
+        min_rows=1, shrink_tolerance=0.8)
+    assert ok is False and "header" in reason.lower()
+
+
+def test_validate_download_rejects_shrink_below_tolerance(tmp_path):
+    p = tmp_path / "short.csv"
+    _write(p, comps.RETAILSTATS_HEADER, ["cloud," + ",".join(["1"] * 20)])
+    ok, reason = comps.validate_download(
+        p, expected_header=comps.RETAILSTATS_HEADER, baseline_rows=100,
+        min_rows=1, shrink_tolerance=0.8)
+    assert ok is False and "shrink" in reason.lower()
+
+
+def test_validate_download_first_run_uses_min_rows_floor(tmp_path):
+    """No sidecar baseline: an error page must not be able to SEED the cache either."""
+    p = tmp_path / "tiny.csv"
+    _write(p, comps.RETAILSTATS_HEADER, ["cloud," + ",".join(["1"] * 20)])
+    ok, reason = comps.validate_download(
+        p, expected_header=comps.RETAILSTATS_HEADER, baseline_rows=None,
+        min_rows=1000, shrink_tolerance=0.8)
+    assert ok is False and "min_rows" in reason.lower()
+
+
+def test_meta_roundtrip_atomic(tmp_path):
+    meta = {"retailstats": {"retrieved": "2026-07-16T10:00:00", "rows": 97568,
+                            "sha256": "abc", "bytes": 10}}
+    comps.write_meta(tmp_path, meta)
+    assert (tmp_path / comps.META_FILENAME).is_file()
+    assert comps.load_meta(tmp_path)["retailstats"]["rows"] == 97568
+
+
+def test_load_meta_missing_or_corrupt_returns_empty(tmp_path):
+    assert comps.load_meta(tmp_path) == {}
+    (tmp_path / comps.META_FILENAME).write_text("{not json", encoding="utf-8")
+    assert comps.load_meta(tmp_path) == {}   # degrade: refresh falls back to first-run rules
+
+
+def test_resolve_cache_path_falls_back_to_prev(tmp_path, caplog):
+    """Crash between `current->.prev` and `tmp->current` leaves NO current file."""
+    import logging
+    cur = tmp_path / "x.csv"
+    prev = tmp_path / "x.csv.prev"
+    prev.write_text("data", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="domainscout.comps"):
+        path, used_prev = comps.resolve_cache_path(cur, prev)
+    assert path == prev and used_prev is True
+    assert "loading .prev" in caplog.text   # must be LOUD, not silent
+
+
+def test_resolve_cache_path_prefers_current(tmp_path):
+    cur = tmp_path / "x.csv"
+    prev = tmp_path / "x.csv.prev"
+    cur.write_text("new", encoding="utf-8")
+    prev.write_text("old", encoding="utf-8")
+    assert comps.resolve_cache_path(cur, prev) == (cur, False)
+
+
+def test_resolve_cache_path_both_missing_raises(tmp_path):
+    with pytest.raises(comps.CompsCacheMissing):
+        comps.resolve_cache_path(tmp_path / "x.csv", tmp_path / "x.csv.prev")
+
+
+def test_cache_age_days(tmp_path):
+    now = datetime(2026, 7, 16, 12, 0, 0)
+    meta = {"retailstats": {"retrieved": (now - timedelta(days=3)).isoformat()}}
+    assert round(comps.cache_age_days(meta, "retailstats", now), 1) == 3.0
+    assert comps.cache_age_days(meta, "tldstats", now) is None
