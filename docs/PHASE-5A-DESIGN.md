@@ -1,6 +1,9 @@
 # Phase 5a — Comps grounding: design
 
-**Status:** 📝 Draft — pending owner review · **Date:** 2026-07-16
+**Status:** ✅ **Approved 2026-07-16** (owner review round 2: per-file swap + metadata sidecar + crash-window
+fallback folded in) — **green light for the plan and build** · **Date:** 2026-07-16
+**Open owner item:** the HumbleWorth interim decision (option 3) still wants an explicit **re-ratification**
+in `DECISIONS.md` — the owner recommended it and approved the phase around it; see *HumbleWorth* below.
 **Companion docs:** [`CLAUDE.md`](../CLAUDE.md) · [`DECISIONS.md`](../DECISIONS.md) · [`docs/TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md) §4.5
 
 > **Phase 5 is built in three sub-phases** (scope call, owner-delegated 2026-07-16). Phase 5 as specified
@@ -138,39 +141,64 @@ New module `domainscout/comps.py`. **Zero new dependencies** — stdlib `csv` + 
 `httpx`/`truststore` client. One network function; everything else is local and pure.
 
 ```
-        [ weekly, cron-safe ]                      [ per-domain, local, no network ]
+        [ weekly, cron-safe ]                        [ per-domain, local, no network ]
 
-  comps-refresh                                 comps --domain X   /   5c Tier-2 prompt
-        │                                                  │
-        ▼                                                  ▼
-  GET /retailstats-download  (6.7 MB)            load_index(cache) -> dict[kw, rawline]
-  GET /tldstats-download     (161 KB)            load_tld_stats(cache) -> dict[ext, dict]
-        │  (no sleep needed; proven cold)                  │
-        ▼                                                  ▼
-  validate_download()  ── fail ─► REFUSE          filters.dict_score(label) -> segmentation
-   parses? header? rows>=80%?      keep cache              │
-        │ pass                     log + exit 0            ▼
-        ▼                                          lookup() -> CompsContext -> value_range JSON
-  swap: current -> .prev, tmp -> current                   │
-        (atomic renames)                                   ▼
-                                                    5c injects into Tier-2 prompt
+  comps-refresh                                   comps --domain X  /  5c Tier-2 prompt
+        │                                                     │
+        │  PER-FILE + INDEPENDENT (retailstats FIRST)         ▼
+        │                                            resolve_cache_path()
+        ├──► retailstats (6.7 MB) ─┐                  current? else .prev + LOUD warn
+        │                          │                          │
+        └──► tldstats   (161 KB) ─┤                          ▼
+             (no sleep between;    │              load_index(path) -> dict[kw, rawline]
+              proven cold)         │              load_tld_stats(path) -> dict[ext, dict]
+                                   │              load_meta() -> per-file {retrieved,rows,sha}
+              for EACH file, independently:                   │
+                                   ▼                          ▼
+                        fresh? ──yes──► skip        filters.dict_score(label) -> segmentation
+                          │ no                                │
+                          ▼                                   ▼
+                     GET -> tmp                     lookup() -> CompsContext -> value_range
+                          │                                   │
+                          ▼                                   ▼
+                   validate() ── fail ─► REFUSE        5c injects into Tier-2 prompt
+                 parse? header? rows>=80%?  (this file only;
+                          │ pass             sibling unaffected)
+                          ▼
+                 swap: current -> .prev, tmp -> current
+                 then update namebio_meta.json entry
 ```
+
+**Per-file independence (owner-required, 2026-07-16 review).** The refresh makes two GETs, and an
+all-or-nothing policy has one genuinely wasteful branch: retailstats validates, tldstats 429s, and we
+discard a good 6.7 MB download **that cost us the long, uncharacterized rate-limit window of gotcha #3** —
+after which the next cron run may 429 on both. A validated download is a **scarce resource**. So each file
+gets its own freshness check, its own gate, its own `.prev`, and its own swap; a tldstats failure leaves a
+freshly-swapped retailstats in place, and the summary reports the mixed outcome.
+**retailstats is fetched first**: if only one file survives the window, it must be the one Tier-2 needs.
 
 ### Public surface
 
 ```python
 # --- cache refresh (the only network path) ---
 def refresh_cache(client, criteria, data_dir, *, force: bool = False,
-                  now: datetime | None = None) -> RefreshResult
+                  now: datetime | None = None) -> RefreshResult      # .files: per-file results
+def refresh_one(client, spec: FileSpec, data_dir, meta, *, force, now) -> FileRefreshResult
 def validate_download(tmp_path, *, expected_header: tuple[str, ...],
-                      current_path: Path | None, min_rows: int,
+                      baseline_rows: int | None, min_rows: int,
                       shrink_tolerance: float) -> tuple[bool, str]   # (ok, reason)
 
+# --- metadata sidecar (source of truth for freshness + shrink baseline) ---
+def load_meta(data_dir) -> dict[str, dict]      # {'retailstats': {retrieved, rows, sha256, bytes}}
+def write_meta(data_dir, meta) -> None          # atomic tmp+rename
+
 # --- local lookup (no network) ---
+def resolve_cache_path(current: Path, prev: Path) -> tuple[Path, bool]  # (path, used_prev)
 def load_index(path) -> dict[str, str]          # keyword -> raw CSV line (parsed on demand)
 def load_tld_stats(path) -> dict[str, dict]     # '.com' -> {period: {stat: value}}
 def parse_placement(line: str, placement: str) -> KeywordComps | None
-def lookup(domain, index, tld_stats, criteria, *, retrieved: str) -> CompsContext
+def lookup(domain, index, tld_stats, criteria, *, retrieved: str | None) -> CompsContext
+def cache_age_days(meta, name, now) -> float | None
 ```
 
 **Memory:** the index is `keyword -> raw CSV line` (~97.5k entries, **≈15 MB**), parsed only on lookup.
@@ -213,32 +241,91 @@ are ≤2 parts by the Phase-3 splitter).
 - **`sale_count` is the confidence signal** — 3 sales is noise, 2,762 is real. 5c's prompt must say so.
 - **`tld_baseline`** is the calibration anchor (is $3k good for a `.com`? vs. the $8,587 retail average).
 - **`modeled: null`** is the reserved `ValuationProvider` slot (gotcha #8's skew warning belongs in 5c's prompt).
+- **`retrieved` comes from `namebio_meta.json`'s `retailstats` entry** — *not* a file mtime and *not* a
+  single global date. Per-file swaps mean the two caches can legitimately differ in age; retailstats is the
+  one Tier-2 reasons from, so its date is the one recorded. `null` (+ warning) if the sidecar is missing.
 
-### Cache integrity — sanity gate + `.prev` (owner-required, 2026-07-16 review)
+### Cache integrity — sanity gate + `.prev` + metadata sidecar (owner-required, 2026-07-16 review)
 
 Atomic tmp+rename guarantees a *complete* file, **not a good one**. HTTP 200 with an error-page-as-CSV, an
 empty body, or a silently truncated export would atomically replace a good cache with garbage — and with
-overwrite-in-place there'd be no previous copy. Therefore:
+overwrite-in-place there'd be no previous copy. Therefore, **per file**:
 
-**`validate_download()` runs BEFORE the swap** and must pass all of:
+**`validate_download()` runs BEFORE that file's swap** and must pass all of:
 1. parses as CSV;
 2. header matches the expected column tuple **exactly**;
-3. row count ≥ `shrink_tolerance` (0.8) × current cache's row count.
+3. row count ≥ `shrink_tolerance` (0.8) × the **sidecar's recorded** row count for that file.
 
-**First run (no current cache):** rule 3 has no baseline, so require header + `min_rows` floor
+**First run (no sidecar baseline):** rule 3 has no baseline, so require header + `min_rows` floor
 (retailstats ≥1,000; tldstats ≥100) — an error page can never *seed* the cache either.
 
-**On pass:** `current → .prev` (replacing any existing `.prev`), then `tmp → current`; both atomic renames.
-Exactly **one** `.prev` is kept — ~13 MB total, not 2.4 GB/yr of dated snapshots.
-**On fail:** delete tmp, leave cache untouched, log the reason, exit 0 (cron-safe; Phase 2's ingest-404
-precedent). `RefreshResult.refused=True` carries the reason to the CLI summary.
+**On pass:** `current → .prev` (replacing any existing `.prev`), then `tmp → current` (both atomic renames),
+then update that file's sidecar entry. Exactly **one** `.prev` per file is kept — ~13 MB total, not
+2.4 GB/yr of dated snapshots.
+**On fail:** delete tmp, leave **that file's** cache untouched, log the reason, exit 0 (cron-safe; Phase 2's
+ingest-404 precedent). The sibling file is **unaffected** — see *Per-file independence* above.
 
 **`--force`** bypasses the freshness no-op **and** the shrink check (a legitimate >20% shrink needs it), but
 **never** the parse/header/floor checks. You can never install an error page, by any flag.
 
+#### `data/namebio_meta.json` — the source of truth for freshness and the shrink baseline
+
+Written atomically (tmp+rename) as each file swaps:
+
+```json
+{"retailstats": {"retrieved": "2026-07-16T11:03:22", "rows": 97568,
+                 "sha256": "9f2c…", "bytes": 6678360},
+ "tldstats":    {"retrieved": "2026-07-16T11:03:24", "rows": 741,
+                 "sha256": "41ab…", "bytes": 161637}}
+```
+
+Why a sidecar rather than file mtimes:
+1. **Per-file `retrieved`.** With per-file swaps (or a mid-week `--force` of one file) the two caches can
+   legitimately differ in age. One global date would be a lie.
+2. **mtimes survive copies/restores badly** — a backup restore or a `cp -r` silently resets "freshness".
+3. **It persists `rows`, killing a re-parse.** The shrink baseline was specced as "the current cache's row
+   count", which meant re-reading 6.7 MB *just to count lines* on every refresh. The sidecar already has it.
+4. **`sha256`** records what we actually installed — for diagnosis and out-of-band-corruption checks.
+   Recorded at swap; **not** verified on every load (that would turn a hand-inspected cache into a hard failure).
+
+**Degradation:** a missing/unparseable sidecar ⇒ **refresh** treats both files as stale and falls back to
+first-run rules (`min_rows` floor); **load** still works, reporting `retrieved: null` plus a warning.
+The sidecar is an optimisation and an audit record — never a hard dependency for reading the cache.
+
+#### Crash window between the two renames (owner nit, 2026-07-16)
+
+`current → .prev` and `tmp → current` are each atomic but **not jointly atomic**: a crash between them leaves
+**no current file**. Vanishingly unlikely, but the fix is one branch in the *load* path, which is pure and
+cheap to test:
+
+```python
+def resolve_cache_path(current, prev):
+    if current.exists():
+        return current, False
+    if prev.exists():
+        log.warning("comps cache %s missing but %s exists — loading .prev "
+                    "(crash between swap renames?); run comps-refresh --force to repair",
+                    current.name, prev.name)
+        return prev, True
+    raise CompsCacheMissing(f"no comps cache at {current} or {prev}; run comps-refresh")
+```
+
 **Permanence** (TDD §4.5: *"Keep these CSVs permanently"*) is satisfied by always holding a full local copy
 plus one predecessor: if NameBio changes terms or vanishes, our cache still works. Dated daily snapshots
 would be 2.4 GB/yr for data that moves glacially.
+
+#### Staleness must be *visible* (owner note, 2026-07-16)
+
+`expected_header` matching **exactly** means a NameBio column addition bricks refresh until a code change.
+That is the correct conservative failure mode — but from cron it fails **silently forever** (exit 0, a log
+line nobody reads), and the pipeline would quietly score against an ageing cache. So staleness surfaces
+where we actually look:
+
+- `comps --domain X` prints cache age per file, e.g.
+  `cache: retailstats 3d (97,568 rows, retrieved 2026-07-16) | tldstats 3d (741 rows)`.
+- Age > `stale_warn_factor` (3) × `refresh_days` ⇒ a loud `⚠️ STALE` line on **both** `comps --domain` and
+  `comps-refresh`.
+- **→ carried to Phase 7:** the digest surfaces comps cache age for the same reason.
 
 ---
 
@@ -254,9 +341,13 @@ tldstats_path = "/tldstats-download"
 refresh_days = 7                    # aggregated stats move glacially; `comps-refresh` is safe to
                                     # call from the daily cron - it NO-OPS unless the cache is older
                                     # than this. Costs nothing to reverse (set 1) if ever wrong.
-shrink_tolerance = 0.8              # refuse a refresh whose row count < 80% of the current cache
-min_rows_retailstats = 1000         # first-run floor (no baseline to compare against)
+shrink_tolerance = 0.8              # refuse a refresh whose row count < 80% of the sidecar's recorded rows
+min_rows_retailstats = 1000         # first-run floor (no sidecar baseline to compare against)
 min_rows_tldstats = 100
+stale_warn_factor = 3               # warn loudly once a cache is older than this x refresh_days.
+                                    # An exact-header match means a NameBio column ADD bricks refresh
+                                    # until a code change - correct, but it fails silently-forever from
+                                    # cron (exit 0). This makes that visible where we actually look.
 
 # NameBio free-tier rate limits — MEASURED 2026-07-16/17, not taken from the docs:
 #   /retailstats, /tldstats  : 4 req / 60 s ROLLING, PER-ENDPOINT (4th ok, 5th -> 429; recovered
@@ -276,7 +367,8 @@ min_rows_tldstats = 100
 ```
 
 Cache files (git-ignored, alongside `data/domainscout.db`):
-`data/namebio_retailstats.csv` (+ `.prev`), `data/namebio_tldstats.csv` (+ `.prev`).
+`data/namebio_retailstats.csv` (+ `.prev`), `data/namebio_tldstats.csv` (+ `.prev`),
+`data/namebio_meta.json` (the per-file `{retrieved, rows, sha256, bytes}` sidecar).
 
 ---
 
@@ -284,25 +376,29 @@ Cache files (git-ignored, alongside `data/domainscout.db`):
 
 ```
 domainscout comps-refresh [--criteria criteria.toml] [--force] [--dry-run]
-    Download + validate + swap the NameBio caches. Idempotent; no-ops if the cache is
-    younger than [comps].refresh_days. Cron-safe: a 429 or a failed sanity gate refuses
-    the swap, leaves the cache intact, logs why, and exits 0.
+    Download + validate + swap the NameBio caches. PER-FILE and independent: each file has
+    its own freshness check, gate, .prev and swap, so one file's failure never discards the
+    other's good download. retailstats is fetched FIRST (if only one survives the rate-limit
+    window, it must be the one Tier-2 needs). Idempotent; a file no-ops if younger than
+    [comps].refresh_days. Cron-safe: a 429 or a failed gate refuses THAT file's swap, leaves
+    its cache intact, logs why, and exits 0.
     --force  re-download even if fresh, and bypass the shrink check (never the header check).
-             WARNING: can burn the download rate-limit window for hours.
+             WARNING: can burn the download rate-limit window for HOURS (gotcha #3).
 
 domainscout comps --domain NAME [--criteria criteria.toml]
-    Print the comps context for one domain (debug). LOCAL ONLY - reads the cache,
-    never touches the network.
+    Print the comps context for one domain, plus per-file cache age (debug).
+    LOCAL ONLY - reads the cache, never touches the network.
 ```
 
 Matches existing precedent: `build-ngrams` (build a local data asset) and `verify --domain` (single-domain debug).
 
-Summary lines:
+Summary lines — note the **mixed outcome** is first-class, not an error path:
 ```
-comps-refresh: retailstats 97,568 rows (6.7 MB) OK | tldstats 741 rows OK | swapped, .prev kept
-comps-refresh: SKIPPED - cache is 2d old (< refresh_days=7); use --force to override
-comps-refresh: REFUSED - retailstats: header mismatch (got 'html'); cache left intact
-comps-refresh: REFUSED - rate-limited (429); cache left intact, next daily run retries
+comps-refresh: retailstats swapped (97,568 rows, 6.7 MB) | tldstats swapped (741 rows)
+comps-refresh: retailstats swapped (97,568 rows, 6.7 MB) | tldstats REFUSED (429; next daily run retries)
+comps-refresh: retailstats skipped (fresh, 2d < 7d) | tldstats skipped (fresh, 2d < 7d)  [--force to override]
+comps-refresh: retailstats REFUSED (header mismatch: got 'html') | tldstats swapped (741 rows)
+comps-refresh: ⚠️ STALE - retailstats 23d old (> 3x refresh_days=7); refresh has been failing
 ```
 
 ---
@@ -317,22 +413,31 @@ comps-refresh: REFUSED - rate-limited (429); cache left intact, next daily run r
 | placement mapping | 1-part → `exact`; 2-part → `start`+`end`; whole-label `exact` always attempted; segmentation reuses `filters.dict_score` |
 | lookup | builds `CompsContext`; absent keyword → "no comparable sales" not an error; `tld_baseline` attached; `modeled` is `null` |
 | JSON | `value_range` round-trips; `modeled` key present-and-null (guards the reserved slot against silent removal) |
-| sanity gate | bad header → refuse; empty/truncated → refuse; rows < 80% → refuse; first-run floor enforced; `--force` bypasses shrink but **NOT** header |
-| swap | on pass: `.prev` retained, current replaced; on fail: cache byte-identical, tmp removed |
-| refresh | no-ops when fresh; `--force` overrides; **429 → refuse + exit 0 + cache intact** (no in-run retry); transport error → `with_backoff` retried |
-| CLI | `comps-refresh --dry-run` writes nothing; `comps --domain` makes **zero** network calls |
+| sanity gate | bad header → refuse; empty/truncated → refuse; rows < 80% of **sidecar** baseline → refuse; first-run floor enforced; `--force` bypasses shrink but **NOT** header |
+| swap | on pass: `.prev` retained, current replaced, sidecar entry updated; on fail: cache byte-identical, tmp removed, sidecar untouched |
+| **per-file independence** | **retailstats OK + tldstats 429 ⇒ retailstats IS swapped** (the wasteful branch this exists to prevent); each file's `.prev`/sidecar entry moves independently; retailstats is fetched first |
+| **metadata sidecar** | written atomically at swap; `rows` used as the next shrink baseline (**no 6.7 MB re-parse**); missing/corrupt sidecar ⇒ refresh falls back to first-run rules **and** load still works with `retrieved: null` + warning |
+| **crash window** | current absent + `.prev` present ⇒ load uses `.prev` and warns loudly; both absent ⇒ `CompsCacheMissing` |
+| refresh | a file no-ops when fresh; `--force` overrides; **429 → refuse that file + exit 0 + its cache intact** (no in-run retry); transport error → `with_backoff` retried |
+| staleness | age > `stale_warn_factor` × `refresh_days` ⇒ `⚠️ STALE` on both `comps --domain` and `comps-refresh` |
+| CLI | `comps-refresh --dry-run` writes nothing (incl. no sidecar write); `comps --domain` makes **zero** network calls |
 
 **Live smoke** (`@pytest.mark.skip`, run manually — the Phase-4 `test_live_smoke_*` pattern): real
 `comps-refresh` against NameBio, assert ~97.5k rows land and the header matches.
 
 ## Build-time real-data confirmations (per "test each phase with real data")
 
-1. `comps-refresh` against live NameBio → 6.7 MB / ~97,568 rows + 741 TLDs land; `.prev` created on the 2nd run.
-2. `comps --domain cloudvault.com` → real `cloud`(start) + `vault`(end) stats.
+1. `comps-refresh` against live NameBio → 6.7 MB / ~97,568 rows + 741 TLDs land; `namebio_meta.json` written
+   with real `rows`/`sha256`; `.prev` created on the 2nd forced run.
+2. `comps --domain cloudvault.com` → real `cloud`(start) + `vault`(end) stats + cache age line.
 3. `comps --domain austinplumber.com` → the geo+service secondary-track case.
 4. `comps --domain vault.com` → single-word `exact` path.
-5. Re-run `comps-refresh` → **no-op** (idempotency).
-6. Corrupt the cache header by hand → refresh **refuses**, cache intact, reason logged.
+5. `comps --domain zylo.com` → invented name, expect **no comps** — confirm it reads as *absence of evidence*,
+   not an error (and that 5c's forward-carried note is warranted).
+6. Re-run `comps-refresh` → **no-op** on both files (idempotency).
+7. Corrupt the cache header by hand → refresh **refuses that file**, cache intact, reason logged.
+8. Delete `namebio_retailstats.csv` leaving `.prev` → `comps --domain` loads `.prev` with a loud warning
+   (the crash-window path).
 
 ⚠️ The download window is currently exhausted by the spike (gotcha #3); the live confirmation must wait
 for it to clear. The suite itself is unaffected (fixtures + fakes).
@@ -359,12 +464,21 @@ for it to clear. The suite itself is unaffected (fixtures + fakes).
 - **→ Phase 5c (Tier-2 prompt):** (a) HumbleWorth's channels are **P50/P97.5/P99.25 of three different
   sale channels**, not a low/mid/high band — never present them as one range; (b) the stats are viciously
   right-skewed (`.com` max $70M vs. $1,748 avg) so `avg ± stddev` must not be offered as a band;
-  (c) `sale_count` is the confidence signal and the prompt must say so.
-- **→ Phase 4 (follow-up proposal):** NameBio exposes a **free, no-auth `POST /verisign`** (+
-  `/verisign-download`) returning the **exact Verisign pending-delete drop order for `.com`** (5 requests ×
-  ≤100 domains / 24 h / IP). Phase 4's build notes record that Verisign's RDAP **omits RGP phase-start
-  dates**, forcing our `today`-anchored estimates — this endpoint could pin real drop dates and directly
-  improve the backorder decision. **Not chased now**; logged for a Phase-4 follow-up.
+  (c) `sale_count` is the confidence signal and the prompt must say so; (d) **"no comps found" means
+  *absence of evidence for this exact keyword pattern*, NOT "worthless"** *(owner note, 2026-07-16)* —
+  invented brandables are **systematically underrepresented** in keyword-keyed retail stats, so a naive
+  prompt would penalise precisely the **secondary-track invented names the pipeline exists to catch**.
+  This is a live failure mode, not a hypothetical: `zylo` → `exact`, 0 sales. The prompt must distinguish
+  *"no comparable sales exist for this pattern"* from *"comparable sales exist and are low."*
+  (e) The digest should surface **comps cache age** for the staleness reason above.
+- **→ Phase 4 (follow-up proposal — owner STRONGLY ENDORSES chasing this, 2026-07-16):** NameBio exposes a
+  **free, no-auth `POST /verisign`** (+ `/verisign-download`) returning the **exact Verisign pending-delete
+  drop order for `.com`** (5 requests × ≤100 domains / 24 h / IP — comfortably covers the Tier-2 pool and
+  then some). Phase 4's build notes record that Verisign's RDAP **omits RGP phase-start dates**, forcing our
+  `today`-anchored estimates — this endpoint **directly fixes the one acknowledged weakness in Phase 4's
+  design** by pinning real drop dates, sharpening the backorder decision. ⚠️ It is **another undocumented-window
+  NameBio endpoint**, so the same **measure-first** discipline as gotcha #3 applies: characterize the limit
+  before designing the retry policy. **Not chased in 5a**; logged as the Phase-4 follow-up.
 
 ---
 
@@ -386,3 +500,14 @@ for it to clear. The suite itself is unaffected (fixtures + fakes).
   exists). Comfortably one plan.
 - **Ambiguity:** the "library vs stage" boundary and the "429 refuse vs retry" inversion are the two places
   a reader could reasonably assume the opposite, so both are stated explicitly with their rationale.
+
+### Review round 2 (owner, 2026-07-16) — folded in
+
+| # | Finding | Resolution |
+|---|---|---|
+| **Gap 1** | Partial-success policy across the two downloads unstated; all-or-nothing would **discard a validated 6.7 MB download** whose sibling 429'd — wasting the scarce, uncharacterized window of gotcha #3 | **Per-file independent validate-and-swap**: own gate, own `.prev`, own swap, own sidecar entry; mixed outcome is a first-class summary line. **retailstats fetched first** so a one-file window yields the file Tier-2 needs |
+| **Gap 2** | `retrieved` had no real per-file source of truth; mtimes survive copies/restores badly; the shrink baseline required re-parsing 6.7 MB **just to count lines** | **`data/namebio_meta.json` sidecar** — per-file `{retrieved, rows, sha256, bytes}`, written atomically at swap. `CompsContext.retrieved` = the **retailstats** entry (the one Tier-2 reasons from). Degrades gracefully: missing ⇒ refresh uses first-run rules, load still works with `retrieved: null` + warning |
+| **Nit** | `current → .prev` then `tmp → current` are atomic but **not jointly** — a crash between leaves no current file | `resolve_cache_path()` in the **load** path (pure, cheap to test): current absent + `.prev` present ⇒ load `.prev` + loud warning; both absent ⇒ `CompsCacheMissing`. Test case added |
+| **Note** | Exact-header match is the right conservative failure, but from cron it fails **silently forever** (exit 0) | `stale_warn_factor = 3`: `⚠️ STALE` on `comps --domain` **and** `comps-refresh`; cache age surfaced per file; carried to the Phase 7 digest |
+| **Note** | A naive 5c prompt would read "no comps" as "worthless", penalising the **invented secondary-track names the pipeline exists to catch** | Added to forward-carried 5c notes as item (d), with `zylo` as the concrete live case; real-data confirmation #5 exercises it |
+| **Note** | Verisign drop-order endpoint: owner **strongly endorses** as the Phase-4 follow-up | Recorded, with the ⚠️ that it is **another undocumented-window endpoint** ⇒ same measure-first discipline as gotcha #3 |
