@@ -1,7 +1,8 @@
 # Phase 5a — Comps grounding: design
 
-**Status:** ✅ **Approved 2026-07-16** (owner review round 2: per-file swap + metadata sidecar + crash-window
-fallback folded in) — **green light for the plan and build** · **Date:** 2026-07-16
+**Status:** ✅ **BUILT 2026-07-17** (8 tasks via subagent-driven-development, per-task + final whole-branch
+review, live real-data confirmation passed; 187 tests pass + 2 skipped). Approved 2026-07-16 (owner review
+round 2: per-file swap + metadata sidecar + crash-window fallback). · **Date:** 2026-07-16
 **Open owner item:** the HumbleWorth interim decision (option 3) still wants an explicit **re-ratification**
 in `DECISIONS.md` — the owner recommended it and approved the phase around it; see *HumbleWorth* below.
 **Companion docs:** [`CLAUDE.md`](../CLAUDE.md) · [`DECISIONS.md`](../DECISIONS.md) · [`docs/TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md) §4.5
@@ -530,8 +531,9 @@ Built via **subagent-driven-development** (8 tasks, a fresh implementer + a spec
 task, controller verification between each, plus review fixes). Implementers ran on the cheap tier
 (complete code in each brief = transcription+testing); reviewers and fixes on the mid tier.
 
-- **Tests:** `python -m pytest -q` → **186 passed, 2 skipped** (the RDAP live smoke + this phase's
+- **Tests:** `python -m pytest -q` → **187 passed, 2 skipped** (the RDAP live smoke + this phase's
   `test_live_smoke_refresh_and_lookup`). **Zero network in the suite** (fixtures + injected `httpx.MockTransport`).
+  (+1 over the per-task total: the final-review cron-safe-encoding regression test.)
 - **Dependencies:** **none added** — stdlib `csv`/`json`/`hashlib`/`logging`/`datetime` + the existing
   `httpx`/`truststore` client (`ingest.make_client`).
 - **Commits:** `18b06e3` (T1 config) · `0344314` (T2 models+fixtures) · `addb055` (T3 index/parse) ·
@@ -551,6 +553,14 @@ task, controller verification between each, plus review fixes). Implementers ran
 - **T7 (2 Important):** `comps --domain` on a missing cache dumped a raw traceback → now a clean stderr
   message + exit 1 (the `CompsCacheMissing` text already names the remedy); and the `comps-refresh --dry-run`
   "writes nothing" constraint had no automated guard → added one.
+- **Final whole-branch review (Important, whole-branch-only):** the `⚠️ STALE` warning was the **only**
+  non-ASCII runtime `print` in the package; on Windows with **redirected** stdout (Task Scheduler/cron →
+  log file, cp1252) it raised `UnicodeEncodeError` → non-zero exit, breaking the cron-safe contract in
+  exactly the stale-cache case it exists to surface (`capsys` is UTF-8, so the suite never caught it; this
+  box runs Python 3.14, pre-UTF-8-default). Marker → ASCII `!! STALE`; added a portable cp1252-encodability
+  regression test (`test_stale_warning_is_cron_log_safe_encoding`). The final review confirmed all 7 binding
+  invariants hold end-to-end and triaged all 9 deferred Minors as safe-to-defer (highest: the `tld_baseline`
+  shallow-copy → **fix in 5c's first commit** before any consumer mutates it).
 
 **Deliberate deviations from the plan/design (each recorded at the time):**
 - **`ratelimit.py` is NOT reused** — it is async, its `RETRYABLE` is whodap-specific, and a comps 429 is an
@@ -562,11 +572,25 @@ task, controller verification between each, plus review fixes). Implementers ran
 - **`[comps]` placed after `[retention]`** in `criteria.toml` (a test trims on `split("[comps]")` and would
   otherwise drop the `_require`d `[retention]` section) — TOML section order is semantically irrelevant.
 
-**Live real-data confirmation — PENDING (window-blocked, not a failure).** The mandated `comps-refresh`
-against live NameBio is deferred: the 2026-07-16 characterization spike **burned the download rate-limit
-window** (gotcha #3 — independent, uncharacterized, >30 min), so a real run would 429 until it clears. The
-suite is unaffected (fixtures + fakes); the live smoke is `@pytest.mark.skip`. To be run once the window
-clears; the design's build-time confirmations #1/#8 (real 97,568-row download; `.prev` on 2nd run) hang on it.
+**Live real-data confirmation — ✅ PASSED (2026-07-17).** Once the download window cleared, `comps-refresh`
+ran against live NameBio and every mandated confirmation passed:
+- **Real download:** `retailstats swapped (97,576 rows, 6.7 MB) | tldstats swapped (740 rows, 0.2 MB)`
+  (97,576 vs the spike's 97,568 — NameBio's hourly aggregates grew slightly, as expected; `.com` retail
+  baseline `n=189,842`).
+- **`comps --domain` on the real cache:** `cloudvault.com` → `cloud`@start (n=289, avg $4,111) + `vault`@end
+  (n=76, avg $2,851); `austinplumber.com` → `austin`@start (n=31) + `plumber`@end (n=16) — the geo+service
+  secondary case; `vault.com` → `vault`@exact (n=4); `zylo.com` → *"no comparable sales for this keyword
+  pattern (absence of evidence — invented names are underrepresented, NOT worthless)"*.
+- **Idempotency:** a plain re-run → `retailstats skipped (fresh, 0d < 7d) | tldstats skipped (fresh, 0d < 7d)`.
+- **429 handling, live:** the two downloads re-burned the window (gotcha #3 in action), so the next `--force`
+  run → `retailstats REFUSED (429; cache intact, next daily run retries) | tldstats REFUSED (429; ...)` —
+  cache left intact, exit 0. Real confirmation of the refuse-don't-retry policy.
+- **Corrupt-header rejection:** `validate_download` on a hand-corrupted real cache → refused
+  (`header mismatch (got 'not', 4 cols; expected 21)`), cache untouched.
+
+`.prev`-on-successful-2nd-swap is covered by `test_refresh_keeps_one_prev_on_swap` (the live 2nd run 429'd
+instead, which gave us the live refuse-and-keep confirmation above). The live smoke stays `@pytest.mark.skip`
+(it needs a cleared window and network); the suite remains fixtures+fakes.
 
 **Deferred Minors (logged in the SDD ledger for the final whole-branch review to triage — none blocking):**
 `tld_baseline` nested-dict shallow-copy aliasing across `CompsContext`s (latent until a caller mutates in

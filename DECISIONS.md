@@ -144,6 +144,30 @@ Carried to 5c: presenting them as one distribution's range would corrupt the mod
 24 h / IP). Phase 4's build notes record that Verisign RDAP **omits RGP phase-start dates**, forcing our
 `today`-anchored estimates — this endpoint could pin real drop dates and sharpen the backorder decision.
 
+### 2026-07-17 — Phase 5a built: comps grounding
+Phase 5a (NameBio comps grounding) built (plan: `docs/superpowers/plans/2026-07-16-phase-5a-comps-grounding.md`;
+design + build notes: `docs/PHASE-5A-DESIGN.md`). **Zero new dependencies** (stdlib `csv`/`json`/`hashlib` +
+the existing `httpx`/`truststore` client). 187 tests pass, zero network in the suite, + 2 skipped live smokes
+(RDAP + comps). Built subagent-driven (implementer + reviewer per task, opus final whole-branch review). Live
+real-data confirmation **passed** 2026-07-17: real 97,576-row / 6.7 MB download; `cloudvault`→cloud@start +
+vault@end, `austinplumber`→austin@start + plumber@end, `vault`→exact, `zylo`→absence-not-$0; idempotent
+no-op; live 429→refused-cache-intact; corrupt-header→refused. Decisions locked during the build:
+- **A library, not a pipeline stage** — `comps.py` is a cache + lookup + CLI; it does **not** write
+  `candidates`. 5c calls `lookup()` and writes `value_range` at scoring time (comps are global context keyed
+  by freshness, needed only for the ~30 domains that reach Tier-2).
+- **Per-file independent refresh** — the two caches download/validate/swap independently (each with its own
+  `.prev` + sidecar entry), retailstats first; one file's 429/failure never discards the other's validated
+  download. A validated 6.7 MB download is scarce (gotcha #3's uncharacterized >30-min window).
+- **429 refused, never retried in-run** (inverts Phase 4): NameBio download 429s recover in hours, so the
+  next daily cron run is the retry. `ratelimit.py` (async, whodap-specific) is deliberately NOT reused; comps
+  has a sync `_get_with_retry` retrying `httpx.TransportError` only.
+- **Validate-before-swap + `.prev` + sidecar** (owner review round 2): an HTTP-200 error-page / truncated /
+  empty download can neither replace nor seed a cache (parse + exact-header + 80%-shrink / first-run min-rows
+  floor); `--force` bypasses freshness + shrink but never the header check; `namebio_meta.json` is the source
+  of truth for freshness and the shrink baseline; a crash between the two swap renames recovers via `.prev`.
+- **`modeled: null` reserved** in `value_range` from day one, so adding HumbleWorth later is a data change,
+  not a schema migration. **NameBio attribution** carried on every `CompsContext` (licence condition → Phase 7).
+
 ### Accepted defaults (owner didn't object; cheap to change)
 - Daily digest: **local markdown file**, top **10** candidates, Tier-2 scoring cutoff ~**30** domains.
 
