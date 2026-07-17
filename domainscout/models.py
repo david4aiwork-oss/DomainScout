@@ -91,3 +91,63 @@ class VerifyCounts:
     errors: int = 0
     left_for_next_run: int = 0
     unmatched: dict = field(default_factory=dict)
+
+
+# NameBio's free-data permission is CONDITIONED on attribution, so this is a licence
+# obligation, not a courtesy. CompsContext carries it so the Phase 7 digest cannot forget.
+NAMEBIO_ATTRIBUTION = "Comparable sales data from NameBio (https://namebio.com)"
+
+
+@dataclass
+class KeywordComps:
+    """One NameBio keyword's stats at ONE placement. price_* are None-free: a keyword
+    absent from the index yields no KeywordComps at all (see comps.lookup)."""
+
+    keyword: str
+    placement: str          # 'exact' | 'start' | 'end' | 'middle'
+    sale_count: int
+    price_avg: float
+    price_max: float
+    price_stddev: float
+
+
+@dataclass
+class CompsContext:
+    """The Tier-2 comps payload for one domain; serialized into candidates.value_range by 5c."""
+
+    domain: str
+    segmentation: str                       # from filters.dict_score, e.g. 'cloud+vault'
+    keywords: tuple[KeywordComps, ...]
+    exact: KeywordComps | None              # whole-label exact lookup (often absent)
+    tld_baseline: dict
+    retrieved: str | None                   # namebio_meta.json retailstats date; None if no sidecar
+    modeled: dict | None = None             # RESERVED ValuationProvider slot (HumbleWorth).
+                                            # MUST serialize as "modeled": null - keeps a later
+                                            # HumbleWorth a data change, never a schema migration.
+    attribution: str = NAMEBIO_ATTRIBUTION
+
+
+@dataclass
+class FileRefreshResult:
+    """One cache file's independent outcome. action: 'swapped'|'skipped_fresh'|'refused'."""
+
+    name: str               # 'retailstats' | 'tldstats'
+    action: str
+    reason: str = ""
+    rows: int | None = None
+    bytes: int | None = None
+
+
+@dataclass
+class RefreshResult:
+    """Per-file results. Mixed outcomes are normal, not an error (design doc: per-file independence)."""
+
+    files: tuple[FileRefreshResult, ...] = ()
+
+    @property
+    def any_swapped(self) -> bool:
+        return any(f.action == "swapped" for f in self.files)
+
+    @property
+    def any_refused(self) -> bool:
+        return any(f.action == "refused" for f in self.files)

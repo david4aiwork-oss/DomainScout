@@ -1,0 +1,3 @@
+extension,all_sale_count,all_price_sum,all_price_avg,all_price_max,all_price_stddev,all_retail_sale_count,all_retail_price_sum,all_retail_price_avg,all_retail_price_max,all_retail_price_stddev
+.com,1448826,2532519355,1747.98,70000000,77814.09,189826,1630039181,8587.02,70000000,214317.64
+.net,120000,90000000,750.00,500000,4200.00,20000,40000000,2000.00,500000,9100.00

@@ -34,3 +34,24 @@ def test_ingest_counts_defaults_zero():
     assert ic.landed == 0
     assert ic.rejected_charset == 0
     assert ic.run_date is None
+
+
+def test_keyword_comps_and_context_shape():
+    from domainscout.models import CompsContext, KeywordComps
+    kw = KeywordComps(keyword="cloud", placement="start", sale_count=2762,
+                      price_avg=3133.18, price_max=500000.0, price_stddev=10466.05)
+    ctx = CompsContext(domain="cloudvault.com", segmentation="cloud+vault",
+                       keywords=(kw,), exact=None, tld_baseline={"extension": ".com"},
+                       retrieved="2026-07-16")
+    assert ctx.modeled is None            # reserved ValuationProvider slot
+    assert ctx.attribution.startswith("Comparable sales data from NameBio")
+
+
+def test_refresh_result_reports_mixed_outcome():
+    from domainscout.models import FileRefreshResult, RefreshResult
+    res = RefreshResult(files=(
+        FileRefreshResult(name="retailstats", action="swapped", reason="", rows=97568, bytes=6678360),
+        FileRefreshResult(name="tldstats", action="refused", reason="429", rows=None, bytes=None),
+    ))
+    assert res.any_swapped is True
+    assert res.any_refused is True
