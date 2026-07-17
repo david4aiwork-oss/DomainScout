@@ -212,3 +212,21 @@ def test_cmd_comps_makes_no_network_calls(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "cloud" in out and "start" in out
     assert "cache:" in out
+
+
+def test_stale_warning_is_cron_log_safe_encoding(tmp_path, capsys):
+    """The stale warning must survive REDIRECTED stdout on Windows (cp1252) — Task Scheduler/cron
+    redirect to a file, where a non-ASCII marker raises UnicodeEncodeError and breaks the exit-0
+    contract in exactly the stale-cache case this feature exists to surface. capsys is UTF-8, so we
+    assert cp1252-encodability explicitly."""
+    from datetime import datetime, timedelta
+    from domainscout import commands, comps
+    from domainscout.config import load_criteria
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    old = (datetime.now() - timedelta(days=90)).isoformat()   # >> stale_warn_factor*refresh_days (21d)
+    comps.write_meta(tmp_path, {"retailstats": {"retrieved": old, "rows": 97568}})
+    commands._warn_if_stale(crit, tmp_path)
+    out = capsys.readouterr().out
+    assert "STALE" in out and "retailstats" in out            # it actually warned
+    out.encode("cp1252")                                       # must NOT raise

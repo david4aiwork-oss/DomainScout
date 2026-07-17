@@ -434,7 +434,7 @@ def summary_line(result: RefreshResult) -> str:
     parts = []
     for f in result.files:
         if f.action == "swapped":
-            size = f" , {f.bytes/1e6:.1f} MB" if f.bytes else ""
+            size = f", {f.bytes/1e6:.1f} MB" if f.bytes else ""
             parts.append(f"{f.name} swapped ({f.rows:,} rows{size})")
         elif f.action == "skipped_fresh":
             parts.append(f"{f.name} skipped ({f.reason})")

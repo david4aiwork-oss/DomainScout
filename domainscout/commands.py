@@ -157,7 +157,7 @@ def _warn_if_stale(criteria, data_dir) -> None:
     for spec in comps.FILE_SPECS:
         age = comps.cache_age_days(meta, spec.name, now)
         if age is not None and age > limit:
-            print(f"  ⚠️  STALE - {spec.name} is {age:.0f}d old (> {criteria.comps_stale_warn_factor}x "
+            print(f"  !! STALE - {spec.name} is {age:.0f}d old (> {criteria.comps_stale_warn_factor}x "
                   f"refresh_days={criteria.comps_refresh_days}); refresh has been failing")
 
 
