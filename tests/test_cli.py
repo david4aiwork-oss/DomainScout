@@ -150,6 +150,40 @@ def test_comps_subcommands_are_no_longer_stubs():
     assert args2.domain == "cloudvault.com"
 
 
+def test_comps_refresh_dry_run_writes_nothing(tmp_path, monkeypatch):
+    """--dry-run must not open a network client, download, or write any cache/sidecar."""
+    from domainscout import commands
+
+    def boom(*a, **k):
+        raise AssertionError("comps-refresh --dry-run must not open a network client")
+
+    monkeypatch.setattr("domainscout.ingest.make_client", boom)
+
+    class A:
+        criteria = str(REPO_ROOT / "criteria.toml")
+        force = False
+        dry_run = True
+        data_dir = str(tmp_path)
+
+    assert commands.cmd_comps_refresh(A()) == 0
+    assert list(tmp_path.iterdir()) == []   # nothing written
+
+
+def test_comps_domain_missing_cache_is_clean_error(tmp_path, capsys):
+    """A missing cache must be a one-line helpful error + nonzero exit, NOT a traceback."""
+    from domainscout import commands
+
+    class A:
+        criteria = str(REPO_ROOT / "criteria.toml")
+        domain = "cloudvault.com"
+        data_dir = str(tmp_path)   # empty dir -> no cache, no .prev
+
+    rc = commands.cmd_comps(A())
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "comps-refresh" in err   # the helpful remediation, not a stack trace
+
+
 def test_cmd_comps_makes_no_network_calls(tmp_path, capsys, monkeypatch):
     """`comps --domain` is LOCAL ONLY - it must never be able to poison a refresh."""
     import shutil

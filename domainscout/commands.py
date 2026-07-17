@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -164,10 +165,14 @@ def cmd_comps(args: argparse.Namespace) -> int:
     """LOCAL ONLY: reads the cache, never touches the network."""
     criteria = load_criteria(args.criteria)
     data_dir = Path(getattr(args, "data_dir", None) or COMPS_DATA_DIR)
-    retail, used_prev_r = comps.resolve_cache_path(
-        data_dir / "namebio_retailstats.csv", data_dir / "namebio_retailstats.csv.prev")
-    tldp, _ = comps.resolve_cache_path(
-        data_dir / "namebio_tldstats.csv", data_dir / "namebio_tldstats.csv.prev")
+    try:
+        retail, used_prev_r = comps.resolve_cache_path(
+            data_dir / "namebio_retailstats.csv", data_dir / "namebio_retailstats.csv.prev")
+        tldp, _ = comps.resolve_cache_path(
+            data_dir / "namebio_tldstats.csv", data_dir / "namebio_tldstats.csv.prev")
+    except comps.CompsCacheMissing as exc:
+        print(f"comps: {exc}", file=sys.stderr)
+        return 1
     meta = comps.load_meta(data_dir)
     now = datetime.now()
 
