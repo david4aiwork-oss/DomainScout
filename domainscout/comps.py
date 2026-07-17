@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import httpx
 import json
 import logging
-from dataclasses import asdict
+import time
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
 from domainscout import filters
-from domainscout.models import CompsContext, KeywordComps
+from domainscout.models import CompsContext, FileRefreshResult, KeywordComps, RefreshResult
 
 # The real 21-column header from GET /retailstats-download (verified live 2026-07-16).
 # Matched EXACTLY before a swap: a NameBio column change must brick the refresh rather
@@ -285,3 +287,147 @@ def context_to_json(ctx: CompsContext) -> str:
         "modeled": ctx.modeled,
         "attribution": ctx.attribution,
     })
+
+
+@dataclass(frozen=True)
+class FileSpec:
+    name: str            # 'retailstats' | 'tldstats'
+    path_attr: str       # Criteria attribute holding the URL path
+    filename: str
+    header: tuple[str, ...]
+    min_rows_attr: str
+
+
+# ORDER MATTERS: retailstats FIRST. If only one file survives the (long, uncharacterized)
+# download rate-limit window, it must be the one Tier-2 actually reasons from.
+FILE_SPECS: tuple[FileSpec, ...] = (
+    FileSpec("retailstats", "comps_retailstats_path", "namebio_retailstats.csv",
+             RETAILSTATS_HEADER, "comps_min_rows_retailstats"),
+    FileSpec("tldstats", "comps_tldstats_path", "namebio_tldstats.csv",
+             None, "comps_min_rows_tldstats"),
+)
+
+
+class RateLimited(Exception):
+    """NameBio returned 429. NOT retryable in-run: recovery takes HOURS (design gotcha #3)."""
+
+
+def _get_with_retry(client, url: str, dest: Path, *, retries: int = 2, sleep=time.sleep) -> int:
+    """Stream url -> dest. Returns bytes written.
+
+    Deliberately NOT ratelimit.with_backoff: that is async, its RETRYABLE is whodap-specific,
+    and a comps 429 arrives as a STATUS CODE not an exception. Retries httpx.TransportError
+    ONLY; a 429 raises RateLimited immediately and is never retried (gotcha #4)."""
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            n = 0
+            with client.stream("GET", url) as resp:
+                if resp.status_code == 429:
+                    raise RateLimited("429 rate limited")
+                resp.raise_for_status()
+                with dest.open("wb") as fh:
+                    for chunk in resp.iter_bytes():
+                        n += len(chunk)
+                        fh.write(chunk)
+            return n
+        except httpx.TransportError as exc:      # transient: worth one more try
+            last = exc
+            dest.unlink(missing_ok=True)
+            if attempt >= retries:
+                raise
+            sleep(min(30.0, 2.0 * (2 ** attempt)))
+    raise last if last else RuntimeError("unreachable")
+
+
+def refresh_one(client, spec: FileSpec, criteria, data_dir: Path, meta: dict, *,
+                force: bool, now: datetime, sleep=time.sleep) -> FileRefreshResult:
+    """One file's INDEPENDENT freshness check -> download -> validate -> swap -> sidecar.
+    A failure here must never affect the sibling file."""
+    current = data_dir / spec.filename
+    prev = data_dir / (spec.filename + ".prev")
+    entry = meta.get(spec.name) or {}
+
+    age = cache_age_days(meta, spec.name, now)
+    if not force and current.is_file() and age is not None and age < criteria.comps_refresh_days:
+        return FileRefreshResult(spec.name, "skipped_fresh",
+                                 f"fresh, {age:.0f}d < {criteria.comps_refresh_days}d",
+                                 rows=entry.get("rows"))
+
+    url = criteria.comps_base_url.rstrip("/") + getattr(criteria, spec.path_attr)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    tmp = data_dir / (spec.filename + ".tmp")
+    try:
+        nbytes = _get_with_retry(client, url, tmp, sleep=sleep)
+    except RateLimited:
+        tmp.unlink(missing_ok=True)
+        return FileRefreshResult(spec.name, "refused",
+                                 "429; cache intact, next daily run retries")
+    except (httpx.HTTPError, OSError) as exc:
+        tmp.unlink(missing_ok=True)
+        return FileRefreshResult(spec.name, "refused", f"{type(exc).__name__}: {exc}")
+
+    header = spec.header
+    if header is None:   # tldstats: NameBio may add periods; key column is what matters
+        with tmp.open("r", encoding="utf-8", newline="") as fh:
+            first = fh.readline().rstrip("\n").rstrip("\r")
+        try:
+            cols = tuple(next(csv.reader([first])))
+        except csv.Error:
+            cols = ()
+        if not cols or cols[0] != TLDSTATS_KEY_COL:
+            tmp.unlink(missing_ok=True)
+            return FileRefreshResult(
+                spec.name, "refused",
+                f"header mismatch (expected first column {TLDSTATS_KEY_COL!r})")
+        header = cols
+
+    # --force bypasses the shrink check (a legitimate >20% shrink needs it) but NEVER
+    # the parse/header/min_rows checks: no flag may install an error page.
+    baseline = None if force else entry.get("rows")
+    ok, reason = validate_download(
+        tmp, expected_header=header, baseline_rows=baseline,
+        min_rows=getattr(criteria, spec.min_rows_attr),
+        shrink_tolerance=criteria.comps_shrink_tolerance,
+    )
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        log.warning("comps: %s refused - %s; cache left intact", spec.name, reason)
+        return FileRefreshResult(spec.name, "refused", reason)
+
+    rows, sha = _count_rows(tmp), _sha256(tmp)
+    if current.is_file():
+        current.replace(prev)      # atomic; keeps exactly ONE predecessor
+    tmp.replace(current)           # atomic
+    meta[spec.name] = {"retrieved": now.isoformat(), "rows": rows,
+                       "sha256": sha, "bytes": nbytes}
+    return FileRefreshResult(spec.name, "swapped", "", rows=rows, bytes=nbytes)
+
+
+def refresh_cache(client, criteria, data_dir, *, force: bool = False,
+                  now: datetime | None = None, sleep=time.sleep) -> RefreshResult:
+    """Refresh both NameBio caches, PER-FILE and INDEPENDENTLY (design doc: per-file
+    independence). One file's 429 must never discard the other's validated download."""
+    now = now or datetime.now()
+    d = Path(data_dir)
+    meta = load_meta(d)
+    results = []
+    for spec in FILE_SPECS:
+        results.append(refresh_one(client, spec, criteria, d, meta,
+                                   force=force, now=now, sleep=sleep))
+    if any(r.action == "swapped" for r in results):
+        write_meta(d, meta)
+    return RefreshResult(files=tuple(results))
+
+
+def summary_line(result: RefreshResult) -> str:
+    parts = []
+    for f in result.files:
+        if f.action == "swapped":
+            size = f" , {f.bytes/1e6:.1f} MB" if f.bytes else ""
+            parts.append(f"{f.name} swapped ({f.rows:,} rows{size})")
+        elif f.action == "skipped_fresh":
+            parts.append(f"{f.name} skipped ({f.reason})")
+        else:
+            parts.append(f"{f.name} REFUSED ({f.reason})")
+    return "comps-refresh: " + " | ".join(parts)

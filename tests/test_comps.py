@@ -2,10 +2,12 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from domainscout import comps
 from domainscout.config import load_criteria
+from domainscout.models import RefreshResult
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 RETAIL = FIXTURES / "namebio_retailstats_small.csv"
@@ -204,3 +206,147 @@ def test_cache_age_days(tmp_path):
     meta = {"retailstats": {"retrieved": (now - timedelta(days=3)).isoformat()}}
     assert round(comps.cache_age_days(meta, "retailstats", now), 1) == 3.0
     assert comps.cache_age_days(meta, "tldstats", now) is None
+
+
+def _fake_client(routes):
+    """routes: url-substring -> (status, body_bytes) or an Exception to raise."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        for frag, outcome in routes.items():
+            if frag in str(request.url):
+                if isinstance(outcome, Exception):
+                    raise outcome
+                status, body = outcome
+                return httpx.Response(status, content=body)
+        return httpx.Response(404, content=b"")
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _good(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+NOW = datetime(2026, 7, 16, 12, 0, 0)
+
+
+def _crit_small():
+    """Fixtures are tiny, so drop the production min_rows floors to 1."""
+    from dataclasses import replace
+    return replace(CRIT, comps_min_rows_retailstats=1, comps_min_rows_tldstats=1)
+
+
+def test_refresh_swaps_both_and_writes_sidecar(tmp_path):
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (200, _good(TLD))})
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    assert [f.action for f in res.files] == ["swapped", "swapped"]
+    assert (tmp_path / "namebio_retailstats.csv").is_file()
+    meta = comps.load_meta(tmp_path)
+    assert meta["retailstats"]["rows"] == 6
+    assert meta["retailstats"]["retrieved"] == NOW.isoformat()
+    assert len(meta["retailstats"]["sha256"]) == 64
+
+
+def test_refresh_retailstats_is_fetched_first(tmp_path):
+    """If only one file survives the rate-limit window it must be the one Tier-2 needs."""
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        body = _good(RETAIL) if "retailstats" in str(request.url) else _good(TLD)
+        return httpx.Response(200, content=body)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    assert "retailstats" in seen[0]
+
+
+def test_refresh_per_file_independence_429_on_second(tmp_path):
+    """THE bug per-file swap exists to prevent: a tldstats 429 must NOT discard a
+    validated 6.7MB retailstats bought with the long, uncharacterized 429 window."""
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (429, b"rate limited")})
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    by = {f.name: f for f in res.files}
+    assert by["retailstats"].action == "swapped"
+    assert by["tldstats"].action == "refused" and "429" in by["tldstats"].reason
+    assert (tmp_path / "namebio_retailstats.csv").is_file()   # KEPT
+    assert not (tmp_path / "namebio_tldstats.csv").exists()
+    assert res.any_swapped and res.any_refused
+
+
+def test_refresh_429_never_retries_in_run(tmp_path):
+    """Recovery takes HOURS -> in-run retry is useless. Exactly one attempt."""
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(429, content=b"")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    assert len(calls) == 2          # one attempt per file, no retries
+    assert all(f.action == "refused" for f in res.files)
+
+
+def test_refresh_retries_transport_error(tmp_path):
+    attempts = []
+
+    def handler(request):
+        attempts.append(str(request.url))
+        if "retailstats" in str(request.url) and len(attempts) == 1:
+            raise httpx.ConnectError("boom")
+        body = _good(RETAIL) if "retailstats" in str(request.url) else _good(TLD)
+        return httpx.Response(200, content=body)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW, sleep=lambda s: None)
+    assert [f.action for f in res.files] == ["swapped", "swapped"]
+
+
+def test_refresh_bad_download_leaves_cache_byte_identical(tmp_path):
+    crit = _crit_small()
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (200, _good(TLD))})
+    comps.refresh_cache(client, crit, tmp_path, now=NOW)
+    before = (tmp_path / "namebio_retailstats.csv").read_bytes()
+
+    bad = _fake_client({"retailstats-download": (200, b"<html>error</html>"),
+                        "tldstats-download": (200, _good(TLD))})
+    res = comps.refresh_cache(bad, crit, tmp_path, now=NOW + timedelta(days=30), force=True)
+    by = {f.name: f for f in res.files}
+    assert by["retailstats"].action == "refused" and "header" in by["retailstats"].reason
+    assert (tmp_path / "namebio_retailstats.csv").read_bytes() == before   # untouched
+
+
+def test_refresh_keeps_one_prev_on_swap(tmp_path):
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (200, _good(TLD))})
+    comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW + timedelta(days=30))
+    assert (tmp_path / "namebio_retailstats.csv.prev").is_file()
+
+
+def test_refresh_noops_when_fresh(tmp_path):
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (200, _good(TLD))})
+    comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW + timedelta(days=2))
+    assert [f.action for f in res.files] == ["skipped_fresh", "skipped_fresh"]
+
+
+def test_refresh_force_overrides_freshness(tmp_path):
+    client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
+                           "tldstats-download": (200, _good(TLD))})
+    comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW)
+    res = comps.refresh_cache(client, _crit_small(), tmp_path,
+                              now=NOW + timedelta(days=2), force=True)
+    assert [f.action for f in res.files] == ["swapped", "swapped"]
+
+
+def test_force_never_bypasses_header_check(tmp_path):
+    """No flag may install an error page."""
+    client = _fake_client({"retailstats-download": (200, b"<html>nope</html>"),
+                           "tldstats-download": (200, _good(TLD))})
+    res = comps.refresh_cache(client, _crit_small(), tmp_path, now=NOW, force=True)
+    by = {f.name: f for f in res.files}
+    assert by["retailstats"].action == "refused" and "header" in by["retailstats"].reason
