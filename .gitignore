@@ -13,6 +13,7 @@ data/*.sqlite3
 *.db-shm
 feeds/          # downloaded daily feed files
 digests/        # generated markdown reports
+data/namebio_*  # Phase 5a NameBio comps caches (regenerable via `domainscout comps-refresh`)
 
 # --- Python ---
 __pycache__/

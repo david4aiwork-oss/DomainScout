@@ -137,3 +137,44 @@ def test_module_entrypoint_runs(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert dbp.exists()
+
+
+def test_comps_subcommands_are_no_longer_stubs():
+    from domainscout.__main__ import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["comps-refresh", "--force"])
+    assert args.func.__name__ == "cmd_comps_refresh"
+    assert args.force is True
+    args2 = parser.parse_args(["comps", "--domain", "cloudvault.com"])
+    assert args2.func.__name__ == "cmd_comps"
+    assert args2.domain == "cloudvault.com"
+
+
+def test_cmd_comps_makes_no_network_calls(tmp_path, capsys, monkeypatch):
+    """`comps --domain` is LOCAL ONLY - it must never be able to poison a refresh."""
+    import shutil
+    from pathlib import Path as _P
+
+    from domainscout import commands, comps
+
+    fx = _P(__file__).resolve().parent / "fixtures"
+    shutil.copy(fx / "namebio_retailstats_small.csv", tmp_path / "namebio_retailstats.csv")
+    shutil.copy(fx / "namebio_tldstats_small.csv", tmp_path / "namebio_tldstats.csv")
+    comps.write_meta(tmp_path, {"retailstats": {"retrieved": "2026-07-16T10:00:00", "rows": 5}})
+
+    def boom(*a, **k):
+        raise AssertionError("comps --domain must not touch the network")
+
+    monkeypatch.setattr("domainscout.ingest.make_client", boom)
+
+    class A:
+        # Absolute path: a bare "criteria.toml" is cwd-fragile (a Phase-4 review
+        # already flagged that pattern in tests/test_config.py).
+        criteria = str(_P(__file__).resolve().parents[1] / "criteria.toml")
+        domain = "cloudvault.com"
+        data_dir = str(tmp_path)
+
+    assert commands.cmd_comps(A()) == 0
+    out = capsys.readouterr().out
+    assert "cloud" in out and "start" in out
+    assert "cache:" in out

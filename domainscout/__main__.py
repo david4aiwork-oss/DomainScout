@@ -89,6 +89,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_outcome.set_defaults(func=commands.cmd_stub)
 
+    p_comps_refresh = sub.add_parser(
+        "comps-refresh",
+        help="[Phase 5a] refresh the NameBio comps caches (idempotent, cron-safe)",
+        description=(
+            "Download + validate + swap the NameBio comps caches. PER-FILE and independent: "
+            "each file has its own gate, .prev and swap, so one file's failure never discards "
+            "the other's good download. retailstats is fetched first. A file no-ops unless "
+            "older than [comps].refresh_days. A 429 or failed gate refuses THAT file, leaves "
+            "its cache intact, and exits 0 - the next daily run is the retry."
+        ),
+    )
+    p_comps_refresh.add_argument("--criteria", default="criteria.toml",
+                                 help="path to criteria.toml (default: criteria.toml)")
+    p_comps_refresh.add_argument(
+        "--force", action="store_true",
+        help="re-download even if fresh, and bypass the shrink check (never the header "
+             "check). WARNING: can burn the NameBio download rate-limit window for HOURS.")
+    p_comps_refresh.add_argument("--data-dir", dest="data_dir",
+                                 help="cache directory (default: data)")
+    p_comps_refresh.add_argument("--dry-run", action="store_true",
+                                 help="print what would happen, write nothing")
+    p_comps_refresh.set_defaults(func=commands.cmd_comps_refresh)
+
+    p_comps = sub.add_parser(
+        "comps",
+        help="[Phase 5a] print the comps context for one domain (local only)",
+        description="LOCAL ONLY - reads the cache, never touches the network.",
+    )
+    p_comps.add_argument("--domain", required=True, help="domain, e.g. cloudvault.com")
+    p_comps.add_argument("--criteria", default="criteria.toml",
+                         help="path to criteria.toml (default: criteria.toml)")
+    p_comps.add_argument("--data-dir", dest="data_dir", help="cache directory (default: data)")
+    p_comps.set_defaults(func=commands.cmd_comps)
+
     for name, help_text in _STUB_HELP.items():
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=commands.cmd_stub)
