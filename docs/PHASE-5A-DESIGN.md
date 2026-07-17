@@ -3,8 +3,9 @@
 **Status:** ✅ **BUILT 2026-07-17** (8 tasks via subagent-driven-development, per-task + final whole-branch
 review, live real-data confirmation passed; 187 tests pass + 2 skipped). Approved 2026-07-16 (owner review
 round 2: per-file swap + metadata sidecar + crash-window fallback). · **Date:** 2026-07-16
-**Open owner item:** the HumbleWorth interim decision (option 3) still wants an explicit **re-ratification**
-in `DECISIONS.md` — the owner recommended it and approved the phase around it; see *HumbleWorth* below.
+**HumbleWorth (resolved 2026-07-17):** owner **re-ratified option 1** — implement the `ValuationProvider`
+against **Replicate at Phase 5c** (~$0.09/mo; `REPLICATE_API_TOKEN` in `.env`), filling the `modeled` slot 5a
+reserved. See *HumbleWorth* below and the 2026-07-17 `DECISIONS.md` entry.
 **Companion docs:** [`CLAUDE.md`](../CLAUDE.md) · [`DECISIONS.md`](../DECISIONS.md) · [`docs/TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md) §4.5
 
 > **Phase 5 is built in three sub-phases** (scope call, owner-delegated 2026-07-16). Phase 5 as specified
@@ -111,7 +112,7 @@ These are **measured**, not read off the docs. Recorded with the same discipline
 
 ---
 
-## HumbleWorth — ratified decision #3.2 is broken (NEEDS RE-RATIFICATION)
+## HumbleWorth — ratified decision #3.2 is broken (✅ RE-RATIFIED 2026-07-17 → Replicate at 5c)
 
 **DECISIONS.md #3.2 ratified:** *"HumbleWorth open-source model (hosted endpoint on Windows-local;
 self-host via Docker on VPS later)."* **That premise is now false.** This is an owner decision, not a doc
@@ -128,16 +129,17 @@ fix, and it gets its own dated DECISIONS.md entry rather than being buried in a 
 **Options:**
 | # | Option | Cost | Friction |
 |---|---|---|---|
-| 1 | **Replicate** (`humbleworth/price-predict-v1`) | $0.10/1k predictions ≈ **$0.09/mo** at 30/day (batch ≤2,560 ⇒ 1 call/day) | needs `REPLICATE_API_TOKEN` signup + `.env`; breaks the $0 property; a 2nd credential alongside the pending Anthropic key |
-| 2 | **Docker self-host now** (`r8.im/humbleworth/price-predict-v1`) | free, unlimited, offline | needs Docker Desktop/WSL2 on Windows now — the friction we deliberately deferred to the VPS; model SPDX license **UNCONFIRMED** |
-| 3 | **Ship NameBio-only; add HumbleWorth at VPS migration** ✅ *(selected)* | $0 | none |
+| 1 | **Replicate** (`humbleworth/price-predict-v1`), **wired at 5c** ✅ *(RATIFIED 2026-07-17)* | $0.10/1k predictions ≈ **$0.09/mo** at 30/day (batch ≤2,560 ⇒ 1 call/day) | needs `REPLICATE_API_TOKEN` in `.env`; a 2nd 5c credential alongside the Anthropic key |
+| 2 | **Docker self-host** (`r8.im/humbleworth/price-predict-v1`) | free, unlimited, offline | Docker Desktop/WSL2 on Windows now — the friction deferred to the VPS; model SPDX license **UNCONFIRMED** |
+| 3 | Ship NameBio-only; add HumbleWorth at VPS migration | $0 | none *(was the interim selection; superseded)* |
 
-**Selected: option 3, with option 1 as an easy upgrade.** Rationale: TDD anti-pattern #11 already makes
-NameBio real sales the **anchor** and warns against relying on a model estimate alone; HumbleWorth is a
-secondary signal whose training data stops early-2024. NameBio stats plus the Tier-2 model's own reasoning
-is a workable v1. **The `value_range` schema reserves `"modeled": null` from day one, so adding HumbleWorth
-later is a data change, never a schema migration.** A `ValuationProvider` interface is *defined* but
-default-OFF and unimplemented (YAGNI: we cannot real-data test a provider we have no token for).
+**Re-ratified 2026-07-17 (owner): option 1 — implement the `ValuationProvider` against Replicate during Phase 5c.**
+(Supersedes the interim option-3 selection recorded during 5a.) **5a itself is unaffected** — it ships
+NameBio-only and the `value_range` schema already reserves `"modeled": null`, so 5c fills it as a **data change,
+never a schema migration**, exactly as designed. NameBio real sales remain the **anchor** (TDD anti-pattern #11:
+model estimates don't stand alone). 5a defines the `ValuationProvider` interface but leaves it default-OFF /
+unimplemented (YAGNI — no token in 5a); 5c implements the Replicate provider. **New 5c credential:**
+`REPLICATE_API_TOKEN`. Docker self-host (option 2) stays the free VPS-phase path for offline valuations later.
 
 **Also corrected (TDD §4.5 is wrong):** the `auction`/`marketplace`/`brokerage` triple is **not** a
 "modeled low/mid/high range". They are **three distinct sale channels** at the **50th / 97.5th / 99.25th**
@@ -496,8 +498,8 @@ for it to clear. The suite itself is unaffected (fixtures + fakes).
 ## Self-review
 
 - **Spec coverage:** every TDD §4.5 comps clause is addressed — NameBio free stats ✅, cached CSV ✅,
-  attribution ✅, HumbleWorth ⚠️ (deferred with an explicit, re-ratification-flagged decision + reserved
-  schema slot), injection into Tier-2 ✅ (shape defined; 5c consumes), empirical spike ✅ (done, recorded).
+  attribution ✅, HumbleWorth ✅ (re-ratified 2026-07-17 → Replicate at 5c; 5a reserves the `modeled` slot),
+  injection into Tier-2 ✅ (shape defined; 5c consumes), empirical spike ✅ (done, recorded).
 - **Ratified-condition check:** #3.2's CONDITION is **discharged** — the spike ran; the free path
   over-delivers; the own-comps hedge is **not** promoted for NameBio. The hedge remains prudent for the
   *undocumented* HumbleWorth endpoint, which option 3 sidesteps entirely for now.

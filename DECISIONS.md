@@ -92,7 +92,7 @@ network in the suite, plus 1 skipped live smoke (`test_live_smoke_known_register
   entries in the unmatched-status tally — every observed RDAP status string was already in `KNOWN_STATUSES`, so no
   additions were needed.
 
-### 2026-07-16 — Phase 5a spike: NameBio free path CONFIRMED; HumbleWorth hosted endpoint DEAD (⚠️ NEEDS RE-RATIFICATION)
+### 2026-07-16 — Phase 5a spike: NameBio free path CONFIRMED; HumbleWorth hosted endpoint DEAD (✅ RESOLVED 2026-07-17 → Replicate at 5c)
 Phase 5 split into three sub-phases (owner-delegated scope call): **5a** comps grounding (NameBio; no API key),
 **5b** toxicity gate (free Google key), **5c** two-tier scoring core (Anthropic key). Each gets its own
 spec → plan → build → real-data test → push. Design: [`docs/PHASE-5A-DESIGN.md`](docs/PHASE-5A-DESIGN.md).
@@ -124,16 +124,20 @@ is **gone**:
 
 | # | Option | Cost | Friction |
 |---|---|---|---|
-| 1 | Replicate `humbleworth/price-predict-v1` | $0.10/1k ≈ **$0.09/mo** at 30/day | needs `REPLICATE_API_TOKEN`; breaks the $0 property; 2nd credential alongside the pending Anthropic key |
+| 1 | **Replicate `humbleworth/price-predict-v1`, wired at 5c** | $0.10/1k ≈ **$0.09/mo** at 30/day | needs `REPLICATE_API_TOKEN` in `.env`; 2nd credential alongside the Anthropic key | ← ✅ **RATIFIED 2026-07-17 (owner)** |
 | 2 | Docker self-host now (`r8.im/...`) | free, offline | Docker Desktop/WSL2 on Windows **now** — the friction deliberately deferred to the VPS; model SPDX license UNCONFIRMED |
-| 3 | **Ship 5a NameBio-only; add HumbleWorth at VPS migration** | $0 | none | ← **selected (interim)** |
+| 3 | Ship 5a NameBio-only; add HumbleWorth at VPS migration | $0 | none | *(was the interim selection; superseded by option 1)* |
 
-**Selected: option 3, with option 1 as an easy upgrade.** NameBio real sales are the anchor per TDD anti-pattern #11
-(*"relying on a model estimate as comps → anchor with NameBio real sales"*); HumbleWorth is a secondary signal trained
-only to early-2024, so NameBio stats + the Tier-2 model's own reasoning is a workable v1. **`value_range` reserves
-`"modeled": null` from day one**, so adding HumbleWorth later is a **data change, never a schema migration**. A
-`ValuationProvider` interface is *defined* but default-OFF and unimplemented (we cannot real-data test a provider we
-have no token for). **Owner: please re-ratify option 3 or redirect.**
+**✅ RE-RATIFIED 2026-07-17 (owner): option 1 — implement the `ValuationProvider` against Replicate during Phase 5c.**
+(Supersedes the interim option-3 selection.) The modeled-valuation leg lands at 5c via Replicate's hosted
+`humbleworth/price-predict-v1` (~$0.09/mo at 30 Tier-2 domains/day; batch ≤2,560 ⇒ 1 call/day), filling the
+`"modeled"` slot that `value_range` reserved (`null`) from 5a — so it is a **data change, not a schema migration**,
+exactly as designed. NameBio real sales remain the **anchor** (TDD anti-pattern #11: *"relying on a model estimate as
+comps → anchor with NameBio real sales"*); HumbleWorth's channels are P50/P97.5/P99.25 of three **sale channels**
+(NOT a low/mid/high band — never present them as one range in the Tier-2 prompt). **New 5c credential:**
+`REPLICATE_API_TOKEN` joins the Anthropic key on the `.env` signup list. Docker self-host (option 2) remains the
+free VPS-phase path if we later want offline/unlimited valuations. This retires ratified #3.2's dead-hosted-endpoint
+leg entirely.
 
 **Also corrected:** TDD §4.5 calls HumbleWorth's `auction`/`marketplace`/`brokerage` triple a *"modeled low/mid/high
 range"* — it is **not**. They are **three distinct sale channels** at the **P50 / P97.5 / P99.25** percentiles.
