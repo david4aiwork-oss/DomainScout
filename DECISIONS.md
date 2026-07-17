@@ -92,6 +92,58 @@ network in the suite, plus 1 skipped live smoke (`test_live_smoke_known_register
   entries in the unmatched-status tally — every observed RDAP status string was already in `KNOWN_STATUSES`, so no
   additions were needed.
 
+### 2026-07-16 — Phase 5a spike: NameBio free path CONFIRMED; HumbleWorth hosted endpoint DEAD (⚠️ NEEDS RE-RATIFICATION)
+Phase 5 split into three sub-phases (owner-delegated scope call): **5a** comps grounding (NameBio; no API key),
+**5b** toxicity gate (free Google key), **5c** two-tier scoring core (Anthropic key). Each gets its own
+spec → plan → build → real-data test → push. Design: [`docs/PHASE-5A-DESIGN.md`](docs/PHASE-5A-DESIGN.md).
+
+**✅ The CONDITION on ratification #3.2 is DISCHARGED — the NameBio empirical spike ran (2026-07-16) and the free
+path over-delivers**, so the own-comps-table hedge is **NOT** promoted for NameBio:
+- Free, no-auth, no-signup **bulk CSVs confirmed live**: `GET /retailstats-download` = **6.7 MB, 97,568 keywords,
+  1.8 s**; `GET /tldstats-download` = 161 KB, 741 TLDs. Exactly the `namebio_comps.csv` the TDD envisioned.
+- **ToS permits it:** *"You may incorporate this data into other products and services, but attribution is
+  required."* The "no product/service" prohibition is scoped to the **Paid API only**. Attribution is therefore a
+  **licence condition**, not a courtesy → must land in the Phase 7 digest.
+- **Measured limits** (not from the docs): stats endpoints **4 req / 60 s rolling, per-endpoint** (5th → 429;
+  recovery ~64 s); **no `Retry-After` / `X-RateLimit-*` headers** (Cloudflare) so backoff must be our own; the
+  `*-download` endpoints have an **independent, much longer window** (>30 min; exact length uncharacterized)
+  ⇒ **a download 429 is NOT retryable in-run — the next daily cron run is the retry.** This deliberately inverts
+  Phase 4's policy, where RDAP 429s recover in seconds.
+- **The pricing snapshot below is stale:** "Basic $10/mo + export ← the budget play" no longer exists (tiers are now
+  Domainer/Business/Enterprise), and "Free = 5 results/search, web only" conflates the **website** cap with the
+  **API**, which has no such cap. **No paid tier is needed for comps.**
+
+**⚠️ Ratification #3.2's HumbleWorth leg is BROKEN — owner decision required, not a doc fix.** #3.2 ratified
+*"HumbleWorth ... (hosted endpoint on Windows-local; self-host via Docker on VPS later)"*. The free hosted endpoint
+is **gone**:
+- `valuation.humbleworth.com` fails the TLS handshake from **our** network (it CNAMEs to `ghs.googlehosted.com`,
+  which closes connections for unmapped SNI) **and** from **Firecrawl's cloud** (`ERR_CONNECTION_CLOSED`) — two
+  independent vantage points — while `humbleworth.com` itself serves fine **through the same proxy**, so this is not
+  our MITM.
+- HumbleWorth's own `/about/api` now documents **only** the Replicate route; the free endpoint is not mentioned at all.
+
+| # | Option | Cost | Friction |
+|---|---|---|---|
+| 1 | Replicate `humbleworth/price-predict-v1` | $0.10/1k ≈ **$0.09/mo** at 30/day | needs `REPLICATE_API_TOKEN`; breaks the $0 property; 2nd credential alongside the pending Anthropic key |
+| 2 | Docker self-host now (`r8.im/...`) | free, offline | Docker Desktop/WSL2 on Windows **now** — the friction deliberately deferred to the VPS; model SPDX license UNCONFIRMED |
+| 3 | **Ship 5a NameBio-only; add HumbleWorth at VPS migration** | $0 | none | ← **selected (interim)** |
+
+**Selected: option 3, with option 1 as an easy upgrade.** NameBio real sales are the anchor per TDD anti-pattern #11
+(*"relying on a model estimate as comps → anchor with NameBio real sales"*); HumbleWorth is a secondary signal trained
+only to early-2024, so NameBio stats + the Tier-2 model's own reasoning is a workable v1. **`value_range` reserves
+`"modeled": null` from day one**, so adding HumbleWorth later is a **data change, never a schema migration**. A
+`ValuationProvider` interface is *defined* but default-OFF and unimplemented (we cannot real-data test a provider we
+have no token for). **Owner: please re-ratify option 3 or redirect.**
+
+**Also corrected:** TDD §4.5 calls HumbleWorth's `auction`/`marketplace`/`brokerage` triple a *"modeled low/mid/high
+range"* — it is **not**. They are **three distinct sale channels** at the **P50 / P97.5 / P99.25** percentiles.
+Carried to 5c: presenting them as one distribution's range would corrupt the model's reconciliation.
+
+**Bonus — Phase-4 follow-up proposal (logged, not chased):** NameBio exposes a free, no-auth `POST /verisign`
+(+ `/verisign-download`) returning the **exact Verisign pending-delete drop order** for .com (5 × ≤100 domains /
+24 h / IP). Phase 4's build notes record that Verisign RDAP **omits RGP phase-start dates**, forcing our
+`today`-anchored estimates — this endpoint could pin real drop dates and sharpen the backorder decision.
+
 ### Accepted defaults (owner didn't object; cheap to change)
 - Daily digest: **local markdown file**, top **10** candidates, Tier-2 scoring cutoff ~**30** domains.
 
@@ -124,11 +176,16 @@ network in the suite, plus 1 skipped live smoke (`test_live_smoke_known_register
 
 > Before ever paying: compare their [credit-based API plans](https://whoisfreaks.com/pricing/api-plans) — metered access to the expiring feed may beat $70 flat for a .com-only daily pull.
 
-**NameBio** ([memberships](https://namebio.com/memberships)):
+**NameBio** ([memberships](https://namebio.com/memberships)) — ⚠️ **STALE as of 2026-07-16, and superseded for
+comps purposes; see the 2026-07-16 Phase-5a entry above.** The "Basic $10/mo" tier no longer exists (tiers are now
+Domainer/Business/Enterprise, prices UNCONFIRMED), and the "Free" row below conflates the **website** results cap
+with the **free API**, which has no such cap and needs no membership. **No paid tier is required for comps** — the
+free `/retailstats-download` + `/tldstats-download` bulk CSVs are the whole comps dataset, and the free-data ToS
+explicitly permits use with attribution. Kept below only as the historical record of the 2026-07-13 research.
 | Tier | Price | Notes |
 |---|---|---|
-| Free | $0 | 5 results/search, web only |
-| Basic | $10/mo ($100/yr) | 100 results/search **+ export** ← the budget play |
+| Free | $0 | 5 results/search, web only ← ⚠️ website only; the free **API** has no such cap |
+| Basic | $10/mo ($100/yr) | 100 results/search **+ export** ← ⚠️ tier no longer exists; export ≠ the free stats CSVs |
 | Pro | $25/mo ($250/yr) | API, but only 100 credits/mo (~3 lookups/day) |
 | Business | $50/mo ($500/yr) | API, 500 credits/mo |
 
