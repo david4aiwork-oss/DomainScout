@@ -16,7 +16,7 @@ CRIT = load_criteria(REPO_ROOT / "criteria.toml")
 
 def test_load_index_keys_by_keyword_and_keeps_raw_line():
     idx = comps.load_index(RETAIL)
-    assert set(idx) == {"cloud", "vault", "austin", "plumber", "shop"}
+    assert set(idx) == {"cloud", "vault", "austin", "plumber", "shop", "cloudvault"}
     assert idx["cloud"].startswith("cloud,")   # raw line retained, parsed on demand
 
 
@@ -101,3 +101,16 @@ def test_context_to_json_always_carries_modeled_null():
     assert payload["source"] == "namebio-free"
     assert payload["attribution"].startswith("Comparable sales data from NameBio")
     assert payload["keywords"][0]["placement"] == "start"
+
+
+def test_lookup_surfaces_whole_label_compound_as_exact():
+    """The `exact` field exists to catch a compound that is ITSELF a NameBio keyword
+    (e.g. 'cloudvault'), separate from its cloud@start + vault@end parts. Guards the
+    branch Phase 5c relies on; without a compound in the fixture this path was untested."""
+    ctx = _ctx("cloudvault.com")
+    # still split into position-based parts...
+    assert [(k.keyword, k.placement) for k in ctx.keywords] == [("cloud", "start"), ("vault", "end")]
+    # ...AND the whole-label compound surfaces SEPARATELY, not double-counted into keywords
+    assert ctx.exact is not None
+    assert ctx.exact.keyword == "cloudvault" and ctx.exact.placement == "exact"
+    assert ctx.exact.sale_count == 3
