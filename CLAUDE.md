@@ -74,7 +74,10 @@ Identity = surrogate `id` PK + partial unique index `UNIQUE(domain) WHERE lifecy
 - [x] Phase 2: ingestion (WhoisFreaks free feed real; Dynadot = interface stub / Phase 2b)
 - [x] Phase 3: rules filter (wordfreq dict gate + log-space trigram pronounceability; mash-only floor −4.0)
 - [x] Phase 4: RDAP verification (whodap async, Verisign-direct, status-driven drop dates, re-verify open rows; DoH recorded-signal)
-- [ ] Phase 5: AI scoring
+- [ ] Phase 5: AI scoring — split into 5a/5b/5c (see docs/PHASE-5A-DESIGN.md)
+  - [x] Phase 5a: comps grounding (NameBio free stats; cached CSV + local lookup; $0, no API key)
+  - [ ] Phase 5b: toxicity gate (Wayback CDX + Safe Browsing; needs a free Google Cloud key)
+  - [ ] Phase 5c: two-tier scoring core (Haiku triage → Sonnet deep, Batch API; NEEDS an Anthropic API key)
 - [ ] Phase 6: outcomes tracker
 - [ ] Phase 7: daily digest
 - [ ] Phase 8: local review UI (FastAPI + uvicorn — view/filter DB + Phase 6/7 results, write-back)

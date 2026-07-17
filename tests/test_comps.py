@@ -368,3 +368,22 @@ def test_refresh_swap_oserror_is_isolated_to_one_file(tmp_path, monkeypatch):
     assert by["retailstats"].action == "refused" and "swap failed" in by["retailstats"].reason
     assert by["tldstats"].action == "swapped"          # sibling unaffected
     assert (tmp_path / "namebio_tldstats.csv").is_file()
+
+
+@pytest.mark.skip(reason="live network - run manually against NameBio's free endpoints")
+def test_live_smoke_refresh_and_lookup(tmp_path):
+    from domainscout.ingest import make_client
+    client = make_client()
+    try:
+        res = comps.refresh_cache(client, CRIT, tmp_path, force=True)
+    finally:
+        client.close()
+    by = {f.name: f for f in res.files}
+    # NB: may legitimately be REFUSED(429) if the download window has not cleared.
+    assert by["retailstats"].action in ("swapped", "refused")
+    if by["retailstats"].action == "swapped":
+        assert by["retailstats"].rows > 50_000       # real file had 97,568
+        ctx = comps.lookup("cloudvault.com", comps.load_index(tmp_path / "namebio_retailstats.csv"),
+                           comps.load_tld_stats(tmp_path / "namebio_tldstats.csv"),
+                           CRIT, retrieved="live")
+        assert any(k.keyword == "cloud" and k.placement == "start" for k in ctx.keywords)

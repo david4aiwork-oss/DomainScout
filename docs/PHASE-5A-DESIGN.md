@@ -521,3 +521,54 @@ for it to clear. The suite itself is unaffected (fixtures + fakes).
 | **Note** | Exact-header match is the right conservative failure, but from cron it fails **silently forever** (exit 0) | `stale_warn_factor = 3`: `⚠️ STALE` on `comps --domain` **and** `comps-refresh`; cache age surfaced per file; carried to the Phase 7 digest |
 | **Note** | A naive 5c prompt would read "no comps" as "worthless", penalising the **invented secondary-track names the pipeline exists to catch** | Added to forward-carried 5c notes as item (d), with `zylo` as the concrete live case; real-data confirmation #5 exercises it |
 | **Note** | Verisign drop-order endpoint: owner **strongly endorses** as the Phase-4 follow-up | Recorded, with the ⚠️ that it is **another undocumented-window endpoint** ⇒ same measure-first discipline as gotcha #3 |
+
+---
+
+## Build notes (2026-07-17)
+
+Built via **subagent-driven-development** (8 tasks, a fresh implementer + a spec/quality reviewer per
+task, controller verification between each, plus review fixes). Implementers ran on the cheap tier
+(complete code in each brief = transcription+testing); reviewers and fixes on the mid tier.
+
+- **Tests:** `python -m pytest -q` → **186 passed, 2 skipped** (the RDAP live smoke + this phase's
+  `test_live_smoke_refresh_and_lookup`). **Zero network in the suite** (fixtures + injected `httpx.MockTransport`).
+- **Dependencies:** **none added** — stdlib `csv`/`json`/`hashlib`/`logging`/`datetime` + the existing
+  `httpx`/`truststore` client (`ingest.make_client`).
+- **Commits:** `18b06e3` (T1 config) · `0344314` (T2 models+fixtures) · `addb055` (T3 index/parse) ·
+  `5b58ff8`+`037195a`+`04ca31c` (T4 lookup + coverage fixes) · `cd39efa` (T5 sidecar/gate/.prev) ·
+  `0fa210d`+`393eba8` (T6 per-file refresh + swap-OSError fix) · `a5e19a4`+`3607aac` (T7 CLI + fixes) ·
+  this commit (T8 smoke + docs).
+
+**Review fixes (all teeth-checked — each proven to fail before the fix):**
+- **T4 (Important):** the whole-label `exact` compound path had no positive coverage — the `exact` field's
+  entire reason to exist (a compound like `cloudvault` that is *itself* a NameBio keyword) was untested.
+  Added a `cloudvault` fixture row + `test_lookup_surfaces_whole_label_compound_as_exact`; then the dedup
+  half too (`assert ctx.exact is None` for a single-word domain). Production code unchanged.
+- **T6 (Important):** the swap block (`_count_rows`/`_sha256`/the two renames) sat *outside* `refresh_one`'s
+  try/except, so an `OSError` mid-swap — **realistic on this Windows dev box, where AV can lock a file during
+  rename** — propagated out of `refresh_cache`, breaking per-file independence and losing the sibling's meta.
+  Wrapped the swap in `try/except OSError` → refuses that file only; `.prev` recovers reads.
+- **T7 (2 Important):** `comps --domain` on a missing cache dumped a raw traceback → now a clean stderr
+  message + exit 1 (the `CompsCacheMissing` text already names the remedy); and the `comps-refresh --dry-run`
+  "writes nothing" constraint had no automated guard → added one.
+
+**Deliberate deviations from the plan/design (each recorded at the time):**
+- **`ratelimit.py` is NOT reused** — it is async, its `RETRYABLE` is whodap-specific, and a comps 429 is an
+  httpx *status code*, not an exception. comps carries a ~12-line sync `_get_with_retry` that retries
+  `httpx.TransportError` only and raises `RateLimited` immediately on 429 (never retried — the daily cron is
+  the retry). The design's testing-table line claiming `with_backoff` reuse was corrected before the build.
+- **`parse_placement` returns `None` on `sale_count == 0`** — a zero-sale placement is *absence of data*, not
+  a $0 comparable; surfacing it as zero would let 5c read "$0 average" as a real comp.
+- **`[comps]` placed after `[retention]`** in `criteria.toml` (a test trims on `split("[comps]")` and would
+  otherwise drop the `_require`d `[retention]` section) — TOML section order is semantically irrelevant.
+
+**Live real-data confirmation — PENDING (window-blocked, not a failure).** The mandated `comps-refresh`
+against live NameBio is deferred: the 2026-07-16 characterization spike **burned the download rate-limit
+window** (gotcha #3 — independent, uncharacterized, >30 min), so a real run would 429 until it clears. The
+suite is unaffected (fixtures + fakes); the live smoke is `@pytest.mark.skip`. To be run once the window
+clears; the design's build-time confirmations #1/#8 (real 97,568-row download; `.prev` on 2nd run) hang on it.
+
+**Deferred Minors (logged in the SDD ledger for the final whole-branch review to triage — none blocking):**
+`tld_baseline` nested-dict shallow-copy aliasing across `CompsContext`s (latent until a caller mutates in
+place); the tldstats header double-parse in `refresh_one`; `cmd_comps` reads `load_meta` twice; the T1 config
+tests assert against values equal to the dataclass defaults (can't distinguish "parsed" from "leaked").
