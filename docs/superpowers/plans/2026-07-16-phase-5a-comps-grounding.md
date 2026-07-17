@@ -789,11 +789,14 @@ def test_load_meta_missing_or_corrupt_returns_empty(tmp_path):
 
 def test_resolve_cache_path_falls_back_to_prev(tmp_path, caplog):
     """Crash between `current->.prev` and `tmp->current` leaves NO current file."""
+    import logging
     cur = tmp_path / "x.csv"
     prev = tmp_path / "x.csv.prev"
     prev.write_text("data", encoding="utf-8")
-    path, used_prev = comps.resolve_cache_path(cur, prev)
+    with caplog.at_level(logging.WARNING, logger="domainscout.comps"):
+        path, used_prev = comps.resolve_cache_path(cur, prev)
     assert path == prev and used_prev is True
+    assert "loading .prev" in caplog.text   # must be LOUD, not silent
 
 
 def test_resolve_cache_path_prefers_current(tmp_path):
@@ -1068,16 +1071,15 @@ def test_refresh_retries_transport_error(tmp_path):
 
 
 def test_refresh_bad_download_leaves_cache_byte_identical(tmp_path):
-    good = _crit_small()
+    crit = _crit_small()
     client = _fake_client({"retailstats-download": (200, _good(RETAIL)),
                            "tldstats-download": (200, _good(TLD))})
-    comps.refresh_cache(client, good, tmp_path, now=NOW)
+    comps.refresh_cache(client, crit, tmp_path, now=NOW)
     before = (tmp_path / "namebio_retailstats.csv").read_bytes()
 
     bad = _fake_client({"retailstats-download": (200, b"<html>error</html>"),
                         "tldstats-download": (200, _good(TLD))})
-    later = NOW + timedelta(days=30)
-    res = bad and comps.refresh_cache(bad, good, tmp_path, now=later, force=True)
+    res = comps.refresh_cache(bad, crit, tmp_path, now=NOW + timedelta(days=30), force=True)
     by = {f.name: f for f in res.files}
     assert by["retailstats"].action == "refused" and "header" in by["retailstats"].reason
     assert (tmp_path / "namebio_retailstats.csv").read_bytes() == before   # untouched
@@ -1331,7 +1333,9 @@ def test_cmd_comps_makes_no_network_calls(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("domainscout.ingest.make_client", boom)
 
     class A:
-        criteria = "criteria.toml"
+        # Absolute path: a bare "criteria.toml" is cwd-fragile (a Phase-4 review
+        # already flagged that pattern in tests/test_config.py).
+        criteria = str(_P(__file__).resolve().parents[1] / "criteria.toml")
         domain = "cloudvault.com"
         data_dir = str(tmp_path)
 
