@@ -47,6 +47,14 @@ class Criteria:
     rdap_recheck_days: dict = field(
         default_factory=lambda: {"pending_delete": 1, "redemption": 2, "grace": 7, "dropped": 7}
     )
+    comps_base_url: str = "https://api.namebio.com"
+    comps_retailstats_path: str = "/retailstats-download"
+    comps_tldstats_path: str = "/tldstats-download"
+    comps_refresh_days: int = 7
+    comps_shrink_tolerance: float = 0.8
+    comps_min_rows_retailstats: int = 1000
+    comps_min_rows_tldstats: int = 100
+    comps_stale_warn_factor: int = 3
 
     @property
     def ingest_max_length(self) -> int:
@@ -147,6 +155,22 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
     rdap_timeout = _as_float(rdap_tbl.get("timeout", 15.0), "[rdap].timeout")
     rdap_user_agent = str(rdap_tbl.get("user_agent", "DomainScout/0.1 (personal expired-domain research)"))
 
+    comps_tbl = data.get("comps", {})
+    if not isinstance(comps_tbl, dict):
+        raise ConfigError("criteria.toml: [comps] must be a table")
+    comps_base_url = str(comps_tbl.get("base_url", "https://api.namebio.com"))
+    comps_retailstats_path = str(comps_tbl.get("retailstats_path", "/retailstats-download"))
+    comps_tldstats_path = str(comps_tbl.get("tldstats_path", "/tldstats-download"))
+    comps_refresh_days = _as_int(comps_tbl.get("refresh_days", 7), "[comps].refresh_days")
+    comps_shrink_tolerance = _as_float(
+        comps_tbl.get("shrink_tolerance", 0.8), "[comps].shrink_tolerance")
+    comps_min_rows_retailstats = _as_int(
+        comps_tbl.get("min_rows_retailstats", 1000), "[comps].min_rows_retailstats")
+    comps_min_rows_tldstats = _as_int(
+        comps_tbl.get("min_rows_tldstats", 100), "[comps].min_rows_tldstats")
+    comps_stale_warn_factor = _as_int(
+        comps_tbl.get("stale_warn_factor", 3), "[comps].stale_warn_factor")
+
     return Criteria(
         tld=tld,
         charset=charset,
@@ -171,4 +195,12 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
         rdap_timeout=rdap_timeout,
         rdap_user_agent=rdap_user_agent,
         rdap_recheck_days=rdap_recheck_days,
+        comps_base_url=comps_base_url,
+        comps_retailstats_path=comps_retailstats_path,
+        comps_tldstats_path=comps_tldstats_path,
+        comps_refresh_days=comps_refresh_days,
+        comps_shrink_tolerance=comps_shrink_tolerance,
+        comps_min_rows_retailstats=comps_min_rows_retailstats,
+        comps_min_rows_tldstats=comps_min_rows_tldstats,
+        comps_stale_warn_factor=comps_stale_warn_factor,
     )

@@ -184,3 +184,33 @@ days = 360
     crit = load_criteria(toml)
     assert crit.rdap_recheck_days == {"pending_delete": 1, "redemption": 2, "grace": 7, "dropped": 7}
     assert crit.rdap_concurrency == 5  # default when [rdap].concurrency absent
+
+
+def test_criteria_has_comps_defaults():
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    assert crit.comps_base_url == "https://api.namebio.com"
+    assert crit.comps_retailstats_path == "/retailstats-download"
+    assert crit.comps_tldstats_path == "/tldstats-download"
+    assert crit.comps_refresh_days == 7
+    assert crit.comps_shrink_tolerance == 0.8
+    assert crit.comps_min_rows_retailstats == 1000
+    assert crit.comps_min_rows_tldstats == 100
+    assert crit.comps_stale_warn_factor == 3
+
+
+def test_comps_section_is_optional(tmp_path):
+    """A criteria.toml with no [comps] still loads, using dataclass defaults."""
+    src = (REPO_ROOT / "criteria.toml").read_text(encoding="utf-8")
+    trimmed = src.split("[comps]")[0]
+    p = tmp_path / "c.toml"
+    p.write_text(trimmed, encoding="utf-8")
+    crit = load_criteria(p)
+    assert crit.comps_refresh_days == 7
+
+
+def test_comps_refresh_days_must_be_int(tmp_path):
+    src = (REPO_ROOT / "criteria.toml").read_text(encoding="utf-8")
+    p = tmp_path / "c.toml"
+    p.write_text(src.replace("refresh_days = 7", 'refresh_days = "weekly"'), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"\[comps\].refresh_days"):
+        load_criteria(p)

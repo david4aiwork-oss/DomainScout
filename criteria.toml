@@ -53,6 +53,36 @@ dropped = 7
 [retention]
 days = 360                        # raw feeds + digests pruned after this; DB is permanent
 
+[comps]                             # Phase 5a — NameBio comps grounding (free tier, $0)
+base_url = "https://api.namebio.com"
+retailstats_path = "/retailstats-download"
+tldstats_path = "/tldstats-download"
+refresh_days = 7                    # aggregated stats move glacially; `comps-refresh` is safe to call
+                                    # from the daily cron - each file NO-OPS unless older than this.
+                                    # Costs nothing to reverse (set 1) if it ever proves wrong.
+shrink_tolerance = 0.8              # refuse a refresh whose row count < 80% of the sidecar's recorded rows
+min_rows_retailstats = 1000         # first-run floor (no sidecar baseline to compare against)
+min_rows_tldstats = 100
+stale_warn_factor = 3               # warn loudly once a cache is older than this x refresh_days.
+                                    # An exact-header match means a NameBio column ADD bricks refresh
+                                    # until a code change - correct, but it fails silently-forever from
+                                    # cron (exit 0), so surface age where we actually look.
+
+# NameBio free-tier rate limits — MEASURED 2026-07-16/17, not taken from the docs:
+#   /retailstats, /tldstats  : 4 req / 60 s ROLLING, PER-ENDPOINT (4th ok, 5th -> 429; recovered at
+#                              ~64 s). During a /retailstats 429, /tldstats still returned 200.
+#   429 headers              : NONE. Cloudflare returns no Retry-After and no X-RateLimit-* --
+#                              backoff must be our own; there is nothing to honour.
+#   *-download endpoints     : INDEPENDENT, MUCH LONGER window. One download of each succeeded cold,
+#                              then both 429'd for >30 min with no other traffic. Exact window
+#                              UNCHARACTERIZED (needs hours of polling); known > 30 min.
+#                              => a download 429 is NOT retryable in-run. The next daily cron run IS
+#                              the retry. This deliberately INVERTS Phase 4's policy, where RDAP 429s
+#                              recover in seconds. Both downloads DO succeed back-to-back when cold,
+#                              so the refresh's 2 GETs need no sleep between them.
+#   WARNING: `comps-refresh --force` can burn the download window and lock you out for HOURS.
+#            `comps --domain` is local-only (reads the cache) and never touches the network.
+
 [sources.whoisfreaks]             # feed location (confirmed against the live repo 2026-07-14)
 base_url = "https://raw.githubusercontent.com/WhoisFreaks/daily-expired-and-dropped-domains/main"
 expired_filename = "{date}-free-expired-domains.csv"   # {date} -> YYYY-MM-DD
