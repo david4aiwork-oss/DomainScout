@@ -86,9 +86,19 @@ These are **measured**, not read off the docs. Recorded with the same discipline
    definitively longer than the 60 s stats window.
 4. **Consequence — a download 429 is NOT retryable in-run.** Seconds-scale retry is useless when recovery
    takes hours. Refuse, keep the old cache, log, exit 0; **the next daily cron run is the retry** (the
-   7-day freshness window gives ~7 days of slack). ⚠️ **This inverts Phase 4's policy**, deliberately:
-   RDAP 429s recover in seconds so `RETRYABLE` includes `RateLimitError`; NameBio download 429s recover in
-   hours so retrying in-run is actively wrong. **Rule: back off on transport errors; refuse immediately on 429.**
+   7-day freshness window gives ~7 days of slack, and once a cache passes `refresh_days` *every* daily run
+   re-attempts until one succeeds). ⚠️ **This inverts Phase 4's policy**, deliberately: RDAP 429s recover in
+   seconds so `ratelimit.RETRYABLE` includes `RateLimitError`; NameBio download 429s recover in hours so
+   retrying in-run is actively wrong. **Rule: back off on transport errors; refuse immediately on 429.**
+
+   ⚠️ **`ratelimit.py` is therefore NOT reused, and this is deliberate — not an oversight to "fix".**
+   Three independent reasons: (a) `TokenBucket`/`with_backoff` are **async**, while comps is **sync**
+   (`ingest.make_client()` → `httpx.Client`); (b) `ratelimit.RETRYABLE` is whodap-specific
+   (`RateLimitError`, `BadStatusCode`) and a comps 429 arrives as an httpx **status code**, not an
+   exception, so `with_backoff` would never see it; (c) `TokenBucket` paces *between* calls — meaningless
+   for two sequential GETs a week that are proven safe back-to-back (gotcha #5). comps.py therefore carries
+   its own ~12-line sync `_get_with_retry()` that retries **`httpx.TransportError` only**. A reviewer
+   seeing "duplicate backoff logic" should read this note first.
 5. **The refresh's two GETs need no sleep between them** — both downloads succeeded back-to-back when cold.
 6. **⚠️ `comps-refresh --force` is a footgun**: it can burn the download window and lock you out for hours.
    `comps --domain` is **local-only** (reads the cache, never touches the network) and cannot poison a refresh.
@@ -418,7 +428,7 @@ comps-refresh: ⚠️ STALE - retailstats 23d old (> 3x refresh_days=7); refresh
 | **per-file independence** | **retailstats OK + tldstats 429 ⇒ retailstats IS swapped** (the wasteful branch this exists to prevent); each file's `.prev`/sidecar entry moves independently; retailstats is fetched first |
 | **metadata sidecar** | written atomically at swap; `rows` used as the next shrink baseline (**no 6.7 MB re-parse**); missing/corrupt sidecar ⇒ refresh falls back to first-run rules **and** load still works with `retrieved: null` + warning |
 | **crash window** | current absent + `.prev` present ⇒ load uses `.prev` and warns loudly; both absent ⇒ `CompsCacheMissing` |
-| refresh | a file no-ops when fresh; `--force` overrides; **429 → refuse that file + exit 0 + its cache intact** (no in-run retry); transport error → `with_backoff` retried |
+| refresh | a file no-ops when fresh; `--force` overrides; **429 → refuse that file + exit 0 + its cache intact** (no in-run retry); transport error → retried by comps' own sync helper (see below) |
 | staleness | age > `stale_warn_factor` × `refresh_days` ⇒ `⚠️ STALE` on both `comps --domain` and `comps-refresh` |
 | CLI | `comps-refresh --dry-run` writes nothing (incl. no sidecar write); `comps --domain` makes **zero** network calls |
 
