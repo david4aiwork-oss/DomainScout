@@ -69,6 +69,9 @@ def test_lookup_single_word_uses_exact():
     ctx = _ctx("vault.com")
     assert ctx.segmentation == "vault"
     assert [(k.keyword, k.placement) for k in ctx.keywords] == [("vault", "exact")]
+    # dedup half: the whole-label lookup finds `vault` too, but it must be nulled out
+    # (already in `keywords`), never double-counted into `exact`.
+    assert ctx.exact is None
 
 
 def test_lookup_geo_service_secondary_track():
