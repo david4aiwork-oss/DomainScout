@@ -42,6 +42,16 @@
 
 ## Task 1: Empirical spike (BLOCKING — decides the CDX query strategy)
 
+> ## ✅ RAN 2026-07-18, commit `fb13325`. DO NOT RE-RUN.
+> **Outcome: the (a)+(d) prior was REFUTED.** Step 9's stop condition fired and the spike correctly
+> refused to improvise. The owner re-planned from its evidence and ratified: **two `matchType=exact`
+> queries per domain (apex + `www.`), each with SERVER-side `collapse=timestamp:6`, merged and
+> de-duplicated**, then bucketed monthly client-side over the merged set.
+> Tasks 2, 4 and 8 below have been **updated to match**; the CDX objective-2 (GSB) half is still
+> outstanding because `.env` did not exist at spike time.
+> Findings: [`docs/PHASE-5B-SPIKE.md`](../../PHASE-5B-SPIKE.md) · report `.superpowers/sdd/task-1-report.md`.
+> The probe scripts below are retained as the record of what was measured, not as work to redo.
+
 **This is a measurement task, not a TDD task.** Its findings settle spec objective 1 and become the fixtures every later task tests against. Nothing else may start until it completes.
 
 **Files:**
@@ -228,7 +238,7 @@ In `domainscout/config.py`, add to the `Criteria` dataclass (all with defaults, 
 ```python
     tox_cdx_base_url: str = "https://web.archive.org/cdx/search/cdx"
     tox_cdx_collapse: str = "timestamp:6"
-    tox_cdx_match_type: str = "domain"
+    tox_cdx_match_type: str = "exact"
     tox_cdx_limit: int = 5000
     tox_cdx_timeout: float = 20.0
     tox_cdx_max_rps: float = 1.0
@@ -500,8 +510,9 @@ def test_parse_cdx_reads_columns_by_name_not_index():
 
 
 def test_parse_cdx_empty_and_header_only_both_mean_no_captures():
-    """Task 1 recorded which of these archive.org actually returns; handle BOTH,
-    because a never-archived domain must never be mistaken for a parse failure."""
+    """MEASURED in Task 1: a never-archived domain returns the literal bytes `[]`, a bare
+    empty array - NOT a header-only response. Both are handled anyway, because a
+    never-archived domain must never be mistaken for a parse failure."""
     assert toxicity.parse_cdx([]) == []
     assert toxicity.parse_cdx([["timestamp", "statuscode", "mimetype", "digest"]]) == []
 
@@ -518,9 +529,9 @@ def test_bucket_monthly_keeps_one_capture_per_calendar_month():
 
 
 def test_bucket_monthly_sorts_by_time_first():
-    """The whole point of client-side bucketing: CDX returns urlkey-ordered rows, so
-    bucketing WITHOUT sorting would sample per-URL-block, reproducing the very
-    semantics bug we moved off the server to avoid."""
+    """CdxClient merges two independently-collapsed host queries (apex + www.), so the
+    merged list is NOT time-ordered and can hold two rows for the same month. Bucketing
+    without sorting would sample by merge order rather than by time."""
     caps = [models.Capture("20220301120000", "200", "text/html", "B"),
             models.Capture("20200115120000", "200", "text/html", "A")]
     assert [c.timestamp for c in toxicity.bucket_monthly(caps)] == \
@@ -598,14 +609,18 @@ def parse_cdx(payload: list) -> list[Capture]:
 
 
 def bucket_monthly(captures: Iterable[Capture]) -> list[Capture]:
-    """Client-side equivalent of CDX's collapse=timestamp:6, applied to the WHOLE
-    time-sorted series rather than per-urlkey block.
+    """Collapse to one capture per calendar month over the WHOLE time-sorted series.
 
-    Server-side collapse runs on ADJACENT rows, and CDX sorts by urlkey before
-    timestamp - so with matchType=domain it yields ~one capture per month PER URL,
-    inflating capture_count and digest_churn by reading URL diversity as content
-    volatility. Sorting by time first and bucketing here makes the metric mean what
-    the config comment claims it means."""
+    CdxClient already asks the server to collapse, but it issues TWO queries per domain
+    (apex + www.) and merges them - so the merged list is neither time-ordered nor free
+    of duplicate months. This pass makes the sampling exact and the result independent
+    of merge order. At ~600 merged rows it is free.
+
+    Historical note (see docs/PHASE-5B-SPIKE.md): server-side collapse is only
+    trustworthy because each query is matchType=exact, i.e. a single urlkey. Under
+    matchType=domain, collapse acts on adjacent rows across THOUSANDS of urlkeys
+    (cnn.com: 2,768), sampling per-URL-block and inflating digest_churn by reading URL
+    diversity as content volatility."""
     seen: set[str] = set()
     out: list[Capture] = []
     for cap in sorted(captures, key=lambda c: c.timestamp):
@@ -1120,7 +1135,7 @@ git commit -m "feat(5b): VerdictCache - never persists unknown_error, misses on 
 - Consumes: `parse_cdx`, `CdxError`, `Criteria`
 - Produces: `class CdxClient` with `__init__(client, criteria)` and `.fetch(domain) -> list[Capture]`. Consumed by Task 10.
 
-**Uses the Task 1 spike's decided query strategy.** The code below implements the expected landing point — **(a) client-side bucketing + (d) a time-bounded tail query**. If Task 1 decided otherwise, adjust `_params` accordingly and note the deviation in the commit message.
+**Query strategy: SETTLED by the Task 1 spike, ratified by the owner 2026-07-18.** The original (a)+(d) prior was **refuted by measurement** — see `docs/PHASE-5B-SPIKE.md`. The code below implements the ratified replacement: **two `matchType=exact` queries per domain (apex + `www.`), each with SERVER-side collapse, merged and de-duplicated.** Do not reintroduce `matchType=domain`, a `from=`-bounded tail query, or a negative limit; all three were measured and all three failed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1134,18 +1149,51 @@ def _fake_client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
-def test_cdx_client_requests_https_and_parses(monkeypatch):
-    seen = {}
+def test_cdx_client_queries_both_hosts_over_https_with_server_collapse():
+    """Two exact queries per domain. The www. one exists because a domain whose apex
+    only 301s to www. would otherwise be shaped from redirect history, and nothing
+    would look wrong."""
+    seen = []
 
     def handler(request):
-        seen["url"] = str(request.url)
+        seen.append(request.url)
         return httpx.Response(200, json=[["timestamp", "statuscode", "mimetype", "digest"],
                                          ["20200115120000", "200", "text/html", "A"]])
 
     crit = load_criteria(REPO_ROOT / "criteria.toml")
     caps = toxicity.CdxClient(_fake_client(handler), crit).fetch("example.com")
-    assert seen["url"].startswith("https://")
-    assert caps[0].digest == "A"
+    assert len(seen) == 2
+    assert all(str(u).startswith("https://") for u in seen)
+    assert {u.params["url"] for u in seen} == {"example.com", "www.example.com"}
+    assert all(u.params["matchType"] == "exact" for u in seen)
+    assert all(u.params["collapse"] == crit.tox_cdx_collapse for u in seen)
+    assert [c.digest for c in caps] == ["A"]      # identical rows de-duped across hosts
+
+
+def test_cdx_client_normalizes_a_www_prefixed_input():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params["url"])
+        return httpx.Response(200, json=[])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    toxicity.CdxClient(_fake_client(handler), crit).fetch("www.example.com")
+    assert set(seen) == {"example.com", "www.example.com"}   # not www.www.example.com
+
+
+def test_cdx_client_one_host_failing_does_not_fail_the_domain():
+    """Partial results survive partial failure, same rule as the two legs of screen()."""
+    def handler(request):
+        if request.url.params["url"].startswith("www."):
+            return httpx.Response(503)
+        return httpx.Response(200, json=[["timestamp", "statuscode", "mimetype", "digest"],
+                                         ["20200115120000", "200", "text/html", "A"]])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    caps = toxicity.CdxClient(_fake_client(handler), crit,
+                              sleep=lambda s: None).fetch("example.com")
+    assert [c.digest for c in caps] == ["A"]
 
 
 def test_cdx_client_raises_cdx_error_on_timeout():
@@ -1157,6 +1205,14 @@ def test_cdx_client_raises_cdx_error_on_timeout():
     crit = load_criteria(REPO_ROOT / "criteria.toml")
     with pytest.raises(toxicity.CdxError):
         toxicity.CdxClient(_fake_client(handler), crit, sleep=lambda s: None).fetch("example.com")
+
+
+def test_cdx_client_never_archived_both_hosts_is_empty_not_an_error():
+    """MEASURED: archive.org returns the literal bytes `[]` for a never-archived name.
+    Empty from both hosts is stable absence -> unknown_no_history, NOT unknown_error."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = toxicity.CdxClient(_fake_client(lambda r: httpx.Response(200, json=[])), crit)
+    assert client.fetch("qzxkvbnmplkjhgfd.com") == []
 
 
 def test_cdx_client_raises_on_5xx_after_retries():
@@ -1171,16 +1227,12 @@ def test_cdx_client_raises_on_5xx_after_retries():
     client = toxicity.CdxClient(_fake_client(handler), crit, sleep=slept.append)
     with pytest.raises(toxicity.CdxError):
         client.fetch("example.com")
-    assert calls["n"] == crit.tox_cdx_max_retries       # retried, then gave up
+    # BOTH hosts are attempted, each exhausting its own retry budget, before the
+    # domain is declared a failure.
+    assert calls["n"] == crit.tox_cdx_max_retries * 2
     assert slept and all(s > 0 for s in slept)          # real backoff, just not real waiting
 
 
-def test_cdx_client_empty_response_is_empty_list_not_an_error():
-    def handler(request):
-        return httpx.Response(200, json=[])
-
-    crit = load_criteria(REPO_ROOT / "criteria.toml")
-    assert toxicity.CdxClient(_fake_client(handler), crit).fetch("nope.com") == []
 ```
 
 Add `from domainscout.config import load_criteria` and `REPO_ROOT = Path(__file__).resolve().parents[1]` to the test file's header.
@@ -1196,35 +1248,43 @@ Append to `domainscout/toxicity.py` (add `import time` and `import httpx` to the
 
 ```python
 class CdxClient:
-    """Wayback CDX. One GET per domain - the API offers no batching.
+    """Wayback CDX. TWO GETs per domain - the apex and the www. host - each
+    matchType=exact with SERVER-side collapse, then merged. No batching exists.
 
-    QUERY STRATEGY (settled by the Task-1 spike, see docs/PHASE-5B-SPIKE.md):
-    server-side collapse is NOT used. CDX sorts by urlkey before timestamp and
-    collapse acts on adjacent rows, so collapsing over matchType=domain samples
-    per-URL rather than per-month. We fetch fields-limited rows and bucket monthly
-    ourselves (bucket_monthly).
+    QUERY STRATEGY (measured in the Task-1 spike, see docs/PHASE-5B-SPIKE.md; do not
+    change without re-measuring). Three alternatives were tested and all three FAILED:
 
-    Timestamps also run ASCENDING, so ANY row-count truncation drops the NEWEST
-    captures first - precisely the tail window this phase exists to examine. Raising
-    the limit only moves the cliff. The tail is therefore bounded by TIME (from=),
-    never by row count."""
+      * matchType=domain, uncollapsed: unmanageable. The single-URL apex alone is
+        72.2 MB / 1,042,676 rows; the domain-wide unbounded query did not finish in
+        257 s+, and a read-timeout never fires because the server trickles bytes.
+      * from=<date> bounding: truncates 6 days into a 2.5-year window. Rows stay
+        urlkey-then-timestamp sorted regardless of the filter, so time-bounding does
+        not defeat row-truncation.
+      * negative limit: reaches recent timestamps but returns 100% ONE static asset
+        (the alphabetically-last urlkey) - zero page-history signal.
+
+    matchType=exact + server collapse works because a single urlkey makes adjacent-row
+    collapse identical to monthly collapse, and because collapsing shrinks 1M+ rows to
+    ~311 - far below any cap, so truncation never engages at all.
+
+    Both hosts are queried because a domain whose apex merely 301s to www. would
+    otherwise yield a shape computed from redirect history, and NOTHING would look
+    wrong - a 301-only history reads as a thin but valid shape."""
 
     def __init__(self, client: httpx.Client, criteria, sleep=time.sleep):
         self.client = client
         self.criteria = criteria
         self.sleep = sleep   # injected so retry tests do not actually wait out the backoff
 
-    def _params(self, domain: str, since: str | None = None) -> dict:
-        params = {
-            "url": domain,
+    def _params(self, host: str) -> dict:
+        return {
+            "url": host,
             "output": "json",
-            "matchType": self.criteria.tox_cdx_match_type,
+            "matchType": self.criteria.tox_cdx_match_type,   # 'exact' - one urlkey
+            "collapse": self.criteria.tox_cdx_collapse,      # server-side; legit on one urlkey
             "fl": "timestamp,statuscode,mimetype,digest",
-            "limit": self.criteria.tox_cdx_limit,
+            "limit": self.criteria.tox_cdx_limit,            # runaway guard; never engages
         }
-        if since:
-            params["from"] = since
-        return params
 
     def _get(self, params: dict) -> list:
         last: Exception | None = None
@@ -1242,22 +1302,31 @@ class CdxClient:
             self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
         raise CdxError(f"CDX failed after {self.criteria.tox_cdx_max_retries} attempts: {last}")
 
+    def hosts(self, domain: str) -> tuple[str, str]:
+        bare = domain[4:] if domain.startswith("www.") else domain
+        return (bare, f"www.{bare}")
+
     def fetch(self, domain: str) -> list[Capture]:
         """Returns [] for a never-archived domain and RAISES CdxError on failure.
         These must stay distinguishable - one is stable absence, the other transient
-        ignorance, and they become different verdicts."""
-        captures = parse_cdx(self._get(self._params(domain)))
-        if not captures:
-            return []
-        # Tail bounded by TIME so truncation cannot remove it. Merged and de-duped;
-        # bucket_monthly sorts, so ordering between the two responses does not matter.
-        cutoff = _months_before(_to_dt(max(c.timestamp for c in captures)),
-                                self.criteria.tox_tail_window_months)
-        try:
-            tail = parse_cdx(self._get(self._params(domain, since=cutoff.strftime("%Y%m%d"))))
-        except CdxError:
-            tail = []   # lifetime already succeeded; a failed tail top-up is not fatal
-        return list({(c.timestamp, c.digest): c for c in captures + tail}.values())
+        ignorance, and they become different verdicts.
+
+        One host failing does NOT fail the domain: if either query succeeds its captures
+        are used, mirroring the partial-results rule. Only a failure of BOTH is CdxError,
+        because only then do we genuinely know nothing."""
+        captures: list[Capture] = []
+        failures: list[str] = []
+        for host in self.hosts(domain):
+            try:
+                captures.extend(parse_cdx(self._get(self._params(host))))
+            except CdxError as exc:
+                failures.append(f"{host}: {exc}")
+        if failures and not captures:
+            raise CdxError(f"CDX failed for every host of {domain} - " + "; ".join(failures))
+        # De-dupe: the two hosts often overlap (and for some domains CDX appears to
+        # canonicalize them to the same record entirely). bucket_monthly re-sorts, so
+        # merge order does not matter.
+        return list({(c.timestamp, c.digest): c for c in captures}.values())
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

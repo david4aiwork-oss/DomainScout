@@ -98,7 +98,7 @@ fails here. Non-negotiable, and the reason Phases 2/4/5a all work.
 | Leg | Call pattern | Role |
 |---|---|---|
 | **Google Safe Browsing v4** | `POST threatMatches:find` — up to **500 URLs per request**, so an entire day's ~30 domains (×2 schemes = 60 URLs) fit in **one** call | **Hard reject** on any match |
-| **Wayback CDX** | 1 GET per domain, no batching available | **Graded signal** → Tier-2 |
+| **Wayback CDX** | **2 GETs per domain** (apex + `www.`, each `matchType=exact` + server collapse), no batching available | **Graded signal** → Tier-2 |
 
 GSB's batching means the whole day's blocklist check costs a single request, so its rate-limit surface is
 effectively nil and **CDX is the only pacing concern** (~1 req/s, own backoff).
@@ -260,13 +260,18 @@ cdx_collapse = "timestamp:6"     # One capture/month. ALL shape thresholds and a
                                  # crawl-frequency artifacts). Changing it invalidates every cached
                                  # verdict - by design, since entries record their collapse and
                                  # miss on mismatch.
-                                 # ** WHETHER THIS IS APPLIED SERVER-SIDE OR CLIENT-SIDE IS THE
-                                 #    SPIKE'S CALL - see "Spike objective 1" below. **
-cdx_match_type = "domain"        # includes subdomain captures (www., shop., ...). Intentional:
-                                 # a business's real history often lives on www., and shape is
-                                 # about the DOMAIN's life, not one hostname's.
-cdx_limit = 5000                 # PROVISIONAL - see spike objective 1; a row-count cap cannot
-                                 # safely bound the tail query.
+                                 # Applied SERVER-side (legitimate: one urlkey per query, so
+                                 # adjacent-row collapse IS monthly collapse), then again
+                                 # client-side over the merged two-host set.
+cdx_match_type = "exact"         # MEASURED 2026-07-18 (spike, see PHASE-5B-SPIKE.md). NOT "domain":
+                                 # matchType=domain spreads the row budget across thousands of
+                                 # urlkeys (cnn.com: 2,768), so collapse samples per-URL-block and
+                                 # digest_churn reads URL DIVERSITY as content volatility. Two exact
+                                 # queries (apex + www.) are issued and merged instead - see
+                                 # CdxClient. Deep-subpath history is deliberately given up; it was
+                                 # the contamination, and shape is the story of the front door.
+cdx_limit = 5000                 # Never engages under the ratified strategy - the worst-case domain
+                                 # measured collapses to 311 rows. Kept as a runaway guard only.
 cdx_timeout = 20.0
 cdx_max_requests_per_sec = 1.0
 cdx_max_retries = 3
@@ -363,7 +368,56 @@ The tests that matter are the ones guarding the traps identified above:
 Mandated as a pre-task, mirroring the NameBio spike that materially changed 5a's design. This project
 documents **measured** limits, not documented ones — a discipline that has now paid twice.
 
-### Spike objective 1 (BLOCKING) — CDX ordering, collapse semantics, and tail reachability
+### Spike objective 1 — ✅ RESOLVED 2026-07-18: (a)+(d) REFUTED; strategy is two collapsed exact queries
+
+**Ran 2026-07-18 (commit `fb13325`). Full measurements: [`docs/PHASE-5B-SPIKE.md`](PHASE-5B-SPIKE.md).**
+The spike hit its Step-9 stop condition and refused to improvise; the owner re-planned from its evidence.
+
+**What failed:**
+
+| Strategy | Measured outcome |
+|---|---|
+| (a) uncollapsed `matchType=domain` | **Unmanageable.** The *single-URL apex alone* is 72.2 MB / 1,042,676 rows / 28 s. The domain-wide unbounded query did not complete in 257 s+, and a 90 s `httpx` read-timeout never fires — the server trickles bytes steadily, so total duration is unbounded from the client's side. `limit=50000` (10×) bought ~10 more years out of 26: *raising the limit only moves the cliff*, confirmed verbatim. |
+| (d) `from=` bounding | **Fails outright.** `from=20240101&limit=5000` truncates at **2024-01-07** — six days into a 2.5-year window. Rows stay urlkey-then-timestamp sorted regardless of the filter, so time-bounding does not defeat row-truncation. |
+| (d′) negative limit | **A third failure mode, unanticipated.** Reaches recent timestamps, but under `matchType=domain` returns **100% one static JS asset** (alphabetically-last urlkey). Answers "is the tail reachable" correctly while carrying zero page-history signal. Its calendar reach is also crawl-density-dependent, so a constant `N` cannot guarantee a 24-month tail across domains. |
+
+**Correction to this document's own review-2 reasoning:** the claim that `matchType=exact` "does not fix it,
+since ascending truncation still eats the tail" was **over-generalized**. The mechanism was right, but
+server-side collapse on a *single* urlkey shrinks 1M+ rows to ~311 — far below any cap — so the truncation
+precondition never holds. Option (b) was dismissed on reasoning that stops applying once collapse is in play.
+
+**✅ RATIFIED STRATEGY (owner, 2026-07-18): two `matchType=exact` queries per domain — the bare apex and
+`www.<domain>` — each with SERVER-side `collapse=timestamp:6`, merged and de-duplicated, then bucketed
+monthly client-side over the merged set.**
+
+- Server-side collapse is **semantically legitimate here**, unlike under `matchType=domain`: one urlkey per
+  query means adjacent-row grouping *is* monthly grouping. The contamination that motivated client-side
+  bucketing does not exist within a single-host query.
+- **Truncation never engages** — ~311 rows against a 5,000 cap for the worst-case domain measured.
+- **Client-side `bucket_monthly` is still applied**, now to the *merged* two-host set. Merging two
+  independently-collapsed series can re-introduce two rows in the same month, so the client-side pass
+  remains necessary — and at ~600 rows it is free. It also makes the result independent of merge order.
+- **Why both hosts:** apex-only was the spike's own candidate, but for a domain whose apex merely 301s to
+  `www`, the shape would be computed from a redirect history and *nothing would look wrong* — a 301-only
+  history reads as a thin but valid shape. The second query costs one small request and removes that
+  silent-failure class.
+- **Loss of deep-subpath history is accepted, and is arguably a feature.** Sub-page URL diversity is
+  precisely the signal that was inflating `digest_churn` into false content-volatility. Domain history
+  *shape* is the story of the site's front door.
+- **One host failing does not fail the domain** — if either query succeeds, its captures are used. Only a
+  failure of *both* raises `CdxError`. (Mirrors the partial-results rule.)
+
+**Open, carried forward (neither blocks the build):** `www.cnn.com` returned **byte-identical** results to
+the apex — either CDX canonicalizes the `www.` prefix or cnn.com is a coincidence; the two-query strategy is
+correct either way (a duplicate merge is a no-op), but it should be checked against a domain where the hosts
+are known to differ. And no CDX saturation test was run: *"no 429 observed"* means **not yet hit**, not
+confirmed absent.
+
+**Settled for free by observation:** a never-archived domain returns the literal bytes `[]` — a bare empty
+array, **not** a header-only response.
+
+<details>
+<summary>Original objective-1 statement (superseded, kept for the record)</summary>
 
 **The design's tail window rests on an assumption the naive query does not satisfy.** Raised in owner review
 2026-07-18; the spike decides the resolution and the plan proceeds from its answer.
@@ -402,6 +456,8 @@ actually appear in the response.** If they do not, the tail window is measuring 
 domain archived since the late 1990s, for worst-case payload size and latency; (b) a deliberate
 **never-archived invented name**, to confirm the zero-capture path; (c) something flip-shaped if one can be
 found. Record rate limits, error modes, payload sizes, and pagination behaviour.
+
+</details>
 
 ### Spike objective 2 — GSB request/response shapes
 
