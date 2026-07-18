@@ -174,6 +174,16 @@ otherwise               -> pass
 
 All non-`reject` verdicts **proceed to Tier-2**, carrying their reason.
 
+### Partial results survive a partial failure
+
+**The verdict reflects the worst leg; the data reflects every leg that succeeded.**
+
+If GSB succeeds (not listed) but CDX times out, the verdict is `unknown_error` — *and*
+`gsb_currently_listed=false` with `gsb_checked_at` still ride along, because they were legitimately
+observed. Conversely a successful `HistoryShape` survives a GSB failure. The dataclass permits this; stating
+it explicitly forecloses the obvious wrong implementation, which nulls the whole verdict on any error and
+silently throws away work that was already paid for. Covered by a dedicated test row.
+
 `unknown_no_history` and `unknown_error` mean genuinely different things and have different futures.
 The first is stable, informative absence — for an invented secondary-track brandable it is mildly
 *reassuring* ("young or never-noticed name"). The second is transient ignorance and is eligible for
@@ -225,7 +235,7 @@ Per-verdict TTLs mirror Phase 4's `recheck_days` shape:
 
 | Verdict | TTL | Rationale |
 |---|---|---|
-| `reject` | 30 d | terminal for our purposes |
+| `reject` | 30 d | **deliberately slow to forgive** — NOT permanent state. GSB listings do age off, so a domain rejected on day 1 that delists on day 10 stays invisible until the TTL expires. Defensible at our volumes (a recently-listed domain is a legitimately scary candidate regardless), but read this as a long TTL, never as a terminal flag. |
 | `pass` | 14 d | GSB listing can change; shape barely does |
 | `unknown_no_history` | 30 d | stable absence |
 | `unknown_error` | *never cached* | always retried next run |
@@ -238,18 +248,25 @@ Measured limits land here as comments, in the house style established by `[rdap]
 
 ```toml
 [toxicity]
-cdx_base_url = "http://web.archive.org/cdx/search/cdx"
-cdx_collapse = "timestamp:6"     # PINNED - one capture/month. ALL shape thresholds and any
-                                 # Tier-2 prompt calibration are relative to this sampling.
-                                 # capture_count and digest_churn are properties of the COLLAPSED
-                                 # series, not the raw archive (arguably better: raw counts are
-                                 # dominated by crawl-frequency artifacts). Changing this
-                                 # invalidates every cached verdict - by design, since entries
-                                 # record their collapse and miss on mismatch.
+cdx_base_url = "https://web.archive.org/cdx/search/cdx"
+                                 # HTTPS, not HTTP: this box MITMs TLS and the whole codebase is
+                                 # hardened for the proxied-TLS path via truststore. One plaintext
+                                 # call would be both unencrypted AND on a differently-behaving
+                                 # code path from everything we've tested.
+cdx_collapse = "timestamp:6"     # One capture/month. ALL shape thresholds and any Tier-2 prompt
+                                 # calibration are relative to this sampling. capture_count and
+                                 # digest_churn are properties of the SAMPLED series, not the raw
+                                 # archive (arguably better: raw counts are dominated by
+                                 # crawl-frequency artifacts). Changing it invalidates every cached
+                                 # verdict - by design, since entries record their collapse and
+                                 # miss on mismatch.
+                                 # ** WHETHER THIS IS APPLIED SERVER-SIDE OR CLIENT-SIDE IS THE
+                                 #    SPIKE'S CALL - see "Spike objective 1" below. **
 cdx_match_type = "domain"        # includes subdomain captures (www., shop., ...). Intentional:
                                  # a business's real history often lives on www., and shape is
                                  # about the DOMAIN's life, not one hostname's.
-cdx_limit = 5000
+cdx_limit = 5000                 # PROVISIONAL - see spike objective 1; a row-count cap cannot
+                                 # safely bound the tail query.
 cdx_timeout = 20.0
 cdx_max_requests_per_sec = 1.0
 cdx_max_retries = 3
@@ -261,6 +278,10 @@ gsb_batch_size = 250             # API cap is 500 URLs; we send 2 schemes x doma
 gsb_timeout = 15.0
 gsb_threat_types = ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE",
                     "POTENTIALLY_HARMFUL_APPLICATION"]
+gsb_platform_types = ["ANY_PLATFORM"]     # v4 REQUIRES all three lists. An empty or omitted list
+gsb_threat_entry_types = ["URL"]          # returns NO MATCHES rather than erroring - a silent
+                                          # false-clean, exactly the failure invariant 2 exists to
+                                          # prevent. Asserted in the spike and in tests.
 
 [toxicity.cache_days]
 reject = 30
@@ -324,6 +345,10 @@ The tests that matter are the ones guarding the traps identified above:
 | CDX timeout → `unknown_error`, never `pass` | invariant 2 |
 | GSB `{}` → clean-snapshot, never parsed as an error | v4 omits `matches` entirely on a clean batch |
 | GSB match → `reject`, threat types recorded | hard-reject leg |
+| GSB ok + CDX error → `unknown_error` **with `gsb_currently_listed` still populated** | partial results survive partial failure |
+| CDX ok + GSB error → `unknown_error` **with `HistoryShape` still populated** | same, mirrored |
+| request body always carries non-empty `platformTypes` and `threatEntryTypes` | an empty list returns no matches instead of erroring — silent false-clean |
+| tail query returns the domain's final window even when the lifetime query truncates | the tail-window guarantee (spike objective 1) |
 | changed `collapse` → cache miss | self-enforcing calibration |
 | `unknown_error` never persisted to cache | retry path stays live |
 | tail-flip fixture → divergence detected where lifetime aggregates look respectable | the whole point of the tail window |
@@ -338,15 +363,57 @@ The tests that matter are the ones guarding the traps identified above:
 Mandated as a pre-task, mirroring the NameBio spike that materially changed 5a's design. This project
 documents **measured** limits, not documented ones — a discipline that has now paid twice.
 
-**CDX:** ~20 real domains, including (a) one **very long-lived, heavily-crawled** domain archived since the
-late 1990s, for worst-case payload size and latency under our collapse setting; (b) a deliberate
-**never-archived invented name**, to confirm the zero-capture path; (c) something flip-shaped if one can be
-found. Record rate limits, error modes, payload sizes, and **whether CDX honours its documented-but-unreliable
-pagination parameters** — the known surprise area.
+### Spike objective 1 (BLOCKING) — CDX ordering, collapse semantics, and tail reachability
 
-**GSB:** confirm the batch cap, quota behaviour, and — specifically — the **empty-vs-match response shapes**,
-verifying that a clean batch returns bare `{}` with no `matches` key so the parser treats absent-key as
-clean-snapshot rather than as a malformed response.
+**The design's tail window rests on an assumption the naive query does not satisfy.** Raised in owner review
+2026-07-18; the spike decides the resolution and the plan proceeds from its answer.
+
+CDX returns rows sorted by **urlkey first, then timestamp ascending**, and `collapse` operates on
+**adjacent** rows. Two consequences:
+
+- **Collapse semantics are wrong as specified.** With `matchType=domain`, `collapse=timestamp:6` yields
+  roughly one capture per month *per URL block* — not one per month across the domain's life. Multi-URL
+  domains would show inflated `capture_count` and inflated `digest_churn`, because different pages
+  legitimately have different digests. That is **URL diversity being misread as content volatility** — and
+  content volatility is exactly what the flip detector keys on.
+- **Row-count truncation cannot safely bound the tail (severe).** `limit=5000` truncates in the returned
+  order, so a heavily-crawled domain can exhaust its budget on alphabetically-early URLs and never reach
+  large parts of the timeline. **And ordering alone does not fix this:** because timestamps run *ascending*
+  within a block, any row-count truncation drops the **newest** captures first — precisely the window this
+  phase exists to examine. The late-life flip detector would fail **silently**, and worst on the big, old,
+  interesting domains where a flip matters most. Raising the limit does not fix it; it only moves the cliff.
+
+**Options to evaluate, in the spike:**
+
+| # | Approach | Assessment |
+|---|---|---|
+| (a) | Keep `matchType=domain`, drop **server-side** collapse; fetch fields-limited rows (`fl=timestamp,statuscode,mimetype,digest`) and bucket monthly **client-side** | Fixes collapse semantics completely and makes `cdx_collapse` a local constant rather than a trusted server behaviour. Does **not** by itself fix truncation. Payload cost must be measured. |
+| (b) | `matchType=exact` on the apex + a second query for `www.` | Loses deep-subdomain history, and — contrary to first impression — **does not fix truncation**, since ascending order still drops the tail. |
+| (c) | Probe whether CDX `sort` / pagination options behave well enough for time-ordered output | The documented-but-unreliable corner. Worth measuring, not worth depending on. |
+| (d) | **Two queries per domain:** a lifetime query (metrics degrade gracefully under truncation) **plus a tail query bounded by `from=`/`to=` or a negative `limit`** | ← **current prior.** Bounding the tail by *time* rather than *row count* makes its presence a guarantee, not a hope. 60 calls/day at our volume is nothing. |
+
+Combining **(a) + (d)** is the expected landing point: client-side bucketing for honest semantics, a
+time-bounded second query for a tail that cannot be truncated away. The spike confirms or refutes it.
+
+**The assertion that decides this:** for a ~25-year heavily-crawled domain, **verify the final two years
+actually appear in the response.** If they do not, the tail window is measuring nothing.
+
+**CDX, remaining measurements:** ~20 real domains including (a) one **very long-lived, heavily-crawled**
+domain archived since the late 1990s, for worst-case payload size and latency; (b) a deliberate
+**never-archived invented name**, to confirm the zero-capture path; (c) something flip-shaped if one can be
+found. Record rate limits, error modes, payload sizes, and pagination behaviour.
+
+### Spike objective 2 — GSB request/response shapes
+
+Confirm the batch cap and quota behaviour, plus two specific shapes:
+
+- **Empty vs. match responses.** A clean batch returns bare `{}` with no `matches` key — verify the parser
+  treats absent-key as *clean-snapshot*, never as a malformed response.
+- **The exact request body.** v4 requires **all three** of `threatTypes`, `platformTypes`, and
+  `threatEntryTypes`. An empty or omitted list returns **no matches rather than an error** — a silent
+  false-clean, which is the exact failure mode invariant 2 exists to prevent. Confirm live that a
+  deliberately-empty list returns no matches, so the guard test is written against observed behaviour rather
+  than assumption.
 
 Findings land in `criteria.toml` comments and become test fixtures.
 
