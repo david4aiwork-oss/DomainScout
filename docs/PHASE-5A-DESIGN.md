@@ -595,6 +595,9 @@ instead, which gave us the live refuse-and-keep confirmation above). The live sm
 (it needs a cleared window and network); the suite remains fixtures+fakes.
 
 **Deferred Minors (logged in the SDD ledger for the final whole-branch review to triage — none blocking):**
-`tld_baseline` nested-dict shallow-copy aliasing across `CompsContext`s (latent until a caller mutates in
-place); the tldstats header double-parse in `refresh_one`; `cmd_comps` reads `load_meta` twice; the T1 config
-tests assert against values equal to the dataclass defaults (can't distinguish "parsed" from "leaked").
+~~`tld_baseline` nested-dict shallow-copy aliasing across `CompsContext`s~~ — ✅ **FIXED 2026-07-18** (`deepcopy`
+at the `lookup` boundary + regression test; the carry-to-5c note is discharged. The aliasing was confirmed
+real, not latent: two contexts built from one `load_tld_stats` shared their period dicts, which 5c would have
+hit the moment it scored a batch off a single load); the tldstats header double-parse in `refresh_one`;
+`cmd_comps` reads `load_meta` twice; the T1 config tests assert against values equal to the dataclass
+defaults (can't distinguish "parsed" from "leaked").

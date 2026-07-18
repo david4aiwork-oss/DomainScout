@@ -99,6 +99,21 @@ def test_lookup_attaches_tld_baseline_and_retrieved():
     assert ctx.retrieved == "2026-07-16"
 
 
+def test_lookup_tld_baseline_is_deep_copied_per_context():
+    """5c scores a batch off ONE loaded tld_stats. A shallow dict() copy leaves the nested
+    period dicts aliased, so a caller normalizing one context's baseline in place would
+    silently rewrite every other candidate's anchor -- and the source stats -- in the same
+    run. Isolate at the boundary rather than trusting every future caller to be read-only."""
+    index, stats = comps.load_index(RETAIL), comps.load_tld_stats(TLD)
+    a = comps.lookup("cloudvault.com", index, stats, CRIT, retrieved="2026-07-16")
+    b = comps.lookup("austinplumber.com", index, stats, CRIT, retrieved="2026-07-16")
+
+    a.tld_baseline["all_retail"]["price_avg"] = 1.0
+
+    assert b.tld_baseline["all_retail"]["price_avg"] == 8587.02
+    assert stats[".com"]["all_retail"]["price_avg"] == 8587.02
+
+
 def test_context_to_json_always_carries_modeled_null():
     """The reserved ValuationProvider slot. If this disappears, adding HumbleWorth later
     becomes a schema migration instead of a data change. Do not 'clean up' the null."""

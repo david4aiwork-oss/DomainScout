@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -267,7 +268,10 @@ def lookup(domain, index, tld_stats, criteria, *, retrieved: str | None = None) 
     ):
         exact = None  # already reported in `keywords`; don't duplicate
 
-    baseline = dict(tld_stats.get(".com") or {})
+    # DEEP copy: tld_stats nests {period: {stat: value}}, and 5c reuses one loaded
+    # tld_stats across a whole scoring batch. A shallow dict() would alias every
+    # context's period dicts to each other and to the source.
+    baseline = deepcopy(tld_stats.get(".com") or {})
     baseline["extension"] = ".com"
     return CompsContext(
         domain=domain, segmentation=seg, keywords=tuple(found), exact=exact,
