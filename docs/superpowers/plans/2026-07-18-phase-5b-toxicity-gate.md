@@ -708,10 +708,18 @@ def test_compute_shape_divergence_is_none_when_tail_covers_whole_life():
     assert shape.divergence is None
 
 
-def test_compute_shape_zero_guard_on_churn_ratio():
-    caps = _caps([(f"20{y}0115120000", "SAME") for y in range(10, 24)])
-    shape = toxicity.compute_shape(caps, tail_window_months=240, tail_min_captures=3)
-    assert shape.divergence is None or shape.divergence.churn_ratio is not None
+def test_compute_shape_divergence_values_are_exact():
+    """Pin the arithmetic, not just the direction. 6 lifetime captures with 3 distinct
+    digests (churn 0.5); the 3 tail captures are all distinct (churn 1.0) -> ratio 2.0."""
+    caps = _caps([("20200115120000", "A"), ("20200715120000", "A"),
+                  ("20210115120000", "B"), ("20230115120000", "C"),
+                  ("20230715120000", "D"), ("20240115120000", "E")])
+    shape = toxicity.compute_shape(caps, tail_window_months=24, tail_min_captures=3)
+    assert shape.lifetime.digest_churn == 0.8333          # 5 distinct / 6
+    assert shape.tail.capture_count == 3                  # 2023-01, 2023-07, 2024-01
+    assert shape.tail.digest_churn == 1.0                 # C, D, E all distinct
+    assert shape.divergence.churn_ratio == 1.2            # 1.0 / 0.8333
+    assert shape.divergence.status_shift == 0.0           # all 2xx in both windows
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1148,20 +1156,23 @@ def test_cdx_client_raises_cdx_error_on_timeout():
 
     crit = load_criteria(REPO_ROOT / "criteria.toml")
     with pytest.raises(toxicity.CdxError):
-        toxicity.CdxClient(_fake_client(handler), crit).fetch("example.com")
+        toxicity.CdxClient(_fake_client(handler), crit, sleep=lambda s: None).fetch("example.com")
 
 
 def test_cdx_client_raises_on_5xx_after_retries():
     calls = {"n": 0}
+    slept = []
 
     def handler(request):
         calls["n"] += 1
         return httpx.Response(503)
 
     crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=slept.append)
     with pytest.raises(toxicity.CdxError):
-        toxicity.CdxClient(_fake_client(handler), crit).fetch("example.com")
-    assert calls["n"] > 1     # it retried
+        client.fetch("example.com")
+    assert calls["n"] == crit.tox_cdx_max_retries       # retried, then gave up
+    assert slept and all(s > 0 for s in slept)          # real backoff, just not real waiting
 
 
 def test_cdx_client_empty_response_is_empty_list_not_an_error():
@@ -1198,9 +1209,10 @@ class CdxClient:
     the limit only moves the cliff. The tail is therefore bounded by TIME (from=),
     never by row count."""
 
-    def __init__(self, client: httpx.Client, criteria):
+    def __init__(self, client: httpx.Client, criteria, sleep=time.sleep):
         self.client = client
         self.criteria = criteria
+        self.sleep = sleep   # injected so retry tests do not actually wait out the backoff
 
     def _params(self, domain: str, since: str | None = None) -> dict:
         params = {
@@ -1227,7 +1239,7 @@ class CdxClient:
                     return resp.json() or []
             except (httpx.TransportError, ValueError) as exc:
                 last = exc
-            time.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
+            self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
         raise CdxError(f"CDX failed after {self.criteria.tox_cdx_max_retries} attempts: {last}")
 
     def fetch(self, domain: str) -> list[Capture]:
