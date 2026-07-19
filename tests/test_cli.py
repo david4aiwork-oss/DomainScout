@@ -265,3 +265,157 @@ def test_screen_output_is_ascii_only(monkeypatch, capsys):
     args = build_parser().parse_args(["screen", "--domain", "a.com", "--dry-run"])
     args.func(args)
     capsys.readouterr().out.encode("cp1252")   # must not raise
+
+
+class _FakeScreenClient:
+    """Stands in for the httpx.Client `ingest.make_client` would return, so tests
+    that walk past the dry-run branch never touch the network."""
+
+    def close(self):
+        pass
+
+
+def _no_network_screen_env(monkeypatch):
+    """Shared setup for tests that must reach past dry-run without any real network:
+    a fake GSB key (so GsbClient.from_env succeeds), a stubbed .env loader (so a real
+    .env file, if one ever exists, cannot interfere), and a fake http client."""
+    monkeypatch.setenv("GOOGLE_SAFE_BROWSING_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr("domainscout.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("domainscout.ingest.make_client", lambda *a, **k: _FakeScreenClient())
+
+
+def test_screen_no_domain_and_no_domains_exits_1_cleanly(capsys):
+    """Finding 1: neither flag is `required`, so args.domain is None by default. Before
+    the fix this fell through to `[d.strip() for d in [None] if d.strip()]` -> a raw
+    AttributeError traceback. Must instead be a clean one-liner naming both flags."""
+    args = build_parser().parse_args(["screen"])
+    rc = args.func(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--domain" in err and "--domains" in err
+    assert "Traceback" not in err
+    assert "AttributeError" not in err
+
+
+def test_screen_domains_empty_string_exits_1_cleanly(capsys):
+    """Same failure class as above, reached via `--domains ""` instead of omission."""
+    args = build_parser().parse_args(["screen", "--domains", ""])
+    rc = args.func(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--domain" in err and "--domains" in err
+    assert "Traceback" not in err
+
+
+def test_screen_domain_and_domains_are_additive_and_deduped(monkeypatch):
+    """Finding 2: both flags together must screen the UNION, --domain first, then
+    --domains in order, with duplicates collapsed to their first occurrence."""
+    _no_network_screen_env(monkeypatch)
+    captured = {}
+
+    def fake_screen(domains, *, cdx, gsb, criteria, cache=None):
+        captured["domains"] = list(domains)
+        return []
+
+    monkeypatch.setattr("domainscout.toxicity.screen", fake_screen)
+    args = build_parser().parse_args([
+        "screen", "--domain", "a.com", "--domains", "b.com,a.com,c.com", "--no-cache",
+    ])
+    rc = args.func(args)
+    assert rc == 0
+    assert captured["domains"] == ["a.com", "b.com", "c.com"]
+
+
+def test_screen_domains_handles_empty_elements_and_trailing_commas(monkeypatch):
+    """Finding 2: `--domains "a.com,,b.com,"` must yield exactly two domains, no crash."""
+    _no_network_screen_env(monkeypatch)
+    captured = {}
+
+    def fake_screen(domains, *, cdx, gsb, criteria, cache=None):
+        captured["domains"] = list(domains)
+        return []
+
+    monkeypatch.setattr("domainscout.toxicity.screen", fake_screen)
+    args = build_parser().parse_args(
+        ["screen", "--domains", "a.com,,b.com,", "--no-cache"])
+    rc = args.func(args)
+    assert rc == 0
+    assert captured["domains"] == ["a.com", "b.com"]
+
+
+def test_screen_dry_run_reports_correct_chunk_count_across_multiple_chunks(monkeypatch, capsys):
+    """Finding 3: the dry-run message hardcoded 'in 1 batch', true only up to
+    tox_gsb_batch_size // 2 domains. This shrinks the batch size via the same criteria
+    object cmd_screen loads (monkeypatching commands.load_criteria, reachable from the
+    test) so 5 domains genuinely span 3 chunks of 2, and asserts the real count."""
+    real_load_criteria = commands.load_criteria
+
+    def shrunk(path):
+        from dataclasses import replace
+        return replace(real_load_criteria(path), tox_gsb_batch_size=4)   # chunk size = 2
+
+    monkeypatch.setattr(commands, "load_criteria", shrunk)
+    domains = ",".join(f"d{i}.com" for i in range(5))   # 5 domains, chunk=2 -> 3 chunks
+    args = build_parser().parse_args(["screen", "--domains", domains, "--dry-run"])
+    rc = args.func(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "5 domain(s)" in out
+    assert "3 batches" in out
+
+
+def test_screen_human_output_covers_every_print_branch_ascii_safe(monkeypatch, capsys):
+    """Finding 4: test_screen_output_is_ascii_only only drives --dry-run, so the
+    non-dry-run print branches (safe-browsing line, lifetime line, divergence line,
+    no-history line) have NO cp1252 regression guard -- capsys is UTF-8 and would not
+    catch the class of bug a previous phase actually shipped. This drives cmd_screen's
+    full human-readable path with hand-built verdicts covering all four branches."""
+    from domainscout import models
+    from domainscout import toxicity as toxicity_mod
+
+    _no_network_screen_env(monkeypatch)
+
+    lifetime = models.ShapeBlock("20100101000000", "20200101000000", 10.0, 20, 10,
+                                 1.0, 0.5, 2.0, {"2xx": 20}, {"text/html": 20})
+    tail = models.ShapeBlock("20190101000000", "20200101000000", 1.0, 5, 1,
+                             1.0, 0.9, 5.0, {"2xx": 2, "3xx": 3}, {"text/html": 5})
+    divergence = models.Divergence(churn_ratio=1.8, status_shift=-0.35, mime_shift=0.1,
+                                   captures_per_year_ratio=2.5)
+    history_with_divergence = models.HistoryShape(lifetime=lifetime, tail=tail,
+                                                   divergence=divergence)
+    history_no_divergence = models.HistoryShape(lifetime=lifetime, tail=None, divergence=None)
+    gsb_hit = models.GsbResult(True, ("MALWARE",), "2026-07-18T00:00:00")
+
+    verdicts = [
+        models.ToxicityVerdict(
+            domain="a.com", verdict=models.VERDICT_REJECT,
+            reason="safe-browsing listed: MALWARE", gsb=gsb_hit,
+            history=history_with_divergence, screened_at="2026-07-18T00:00:00",
+            collapse="timestamp:6"),
+        models.ToxicityVerdict(
+            domain="b.com", verdict=models.VERDICT_UNKNOWN_NO_HISTORY,
+            reason="no wayback captures", gsb=None, history=None,
+            screened_at="2026-07-18T00:00:00", collapse="timestamp:6"),
+        models.ToxicityVerdict(
+            domain="c.com", verdict=models.VERDICT_PASS,
+            reason="not currently listed; history shape recorded", gsb=None,
+            history=history_no_divergence, screened_at="2026-07-18T00:00:00",
+            collapse="timestamp:6"),
+    ]
+
+    def fake_screen(domains, *, cdx, gsb, criteria, cache=None):
+        return verdicts
+
+    monkeypatch.setattr(toxicity_mod, "screen", fake_screen)
+
+    args = build_parser().parse_args(
+        ["screen", "--domains", "a.com,b.com,c.com", "--no-cache"])
+    rc = args.func(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "safe-browsing currently_listed" in out
+    assert "tail divergence: churn_ratio" in out
+    assert "tail divergence: n/a" in out
+    assert "no wayback captures" in out
+    out.encode("cp1252")   # must NOT raise

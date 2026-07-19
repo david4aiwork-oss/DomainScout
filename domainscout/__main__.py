@@ -133,8 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
             "are never cached, so they retry on the next run."
         ),
     )
-    p_screen.add_argument("--domain", help="a single domain, e.g. cloudvault.com")
-    p_screen.add_argument("--domains", help="comma-separated list (exercises GSB batching)")
+    p_screen.add_argument("--domain", help="a single domain, e.g. cloudvault.com "
+                          "(additive with --domains: --domain is screened first, "
+                          "duplicates dropped)")
+    p_screen.add_argument("--domains", help="comma-separated list (additive with --domain; "
+                          "exercises GSB batching). Blank/trailing entries are ignored")
     p_screen.add_argument("--criteria", default="criteria.toml",
                           help="path to criteria.toml (default: criteria.toml)")
     p_screen.add_argument("--cache-path", dest="cache_path",

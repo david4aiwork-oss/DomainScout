@@ -1920,15 +1920,68 @@ Expected: FAIL — `argument <command>: invalid choice: 'screen'`
 
 Append to `domainscout/commands.py` (add `toxicity` to the `from domainscout import ...` line and `from domainscout import config` for `load_dotenv`):
 
+**Post-ship correction (Task 11 review, findings 1-3):** the code block below is the
+ORIGINAL as-planned shape. It shipped with three bugs, fixed in the same task's review
+pass and reflected in the code actually committed:
+
+1. Neither `--domain` nor `--domains` is `required`, so calling `screen` with no
+   flags left `args.domain is None`, and `[d.strip() for d in [None] if d.strip()]`
+   raised a raw `AttributeError` traceback instead of a clean CLI error. Fixed by a
+   `_collect_screen_domains(args)` helper that validates BEFORE use and prints a
+   one-line `sys.stderr` message + `return 1` when nothing was given.
+2. `--domain` and `--domains` together silently used only `--domains`. Fixed by
+   making them ADDITIVE (`--domain` first, then `--domains` in order), de-duplicated
+   by first-seen position, with blank/trailing-comma elements dropped rather than
+   crashing.
+3. The dry-run message hardcoded `"in 1 batch"`, true only up to
+   `tox_gsb_batch_size // 2` domains (125 by default). Fixed by a `_gsb_chunk_count()`
+   helper that mirrors `GsbClient.check`'s own chunk math exactly.
+
+The shipped `cmd_screen` (see `domainscout/commands.py`) is:
+
 ```python
+_GSB_URLS_PER_DOMAIN = 2   # http + https; must mirror GsbClient.check's own `per_domain`
+
+
+def _collect_screen_domains(args: argparse.Namespace) -> list[str]:
+    """--domain and --domains are ADDITIVE: --domain first, then --domains in order,
+    de-duplicated by first-seen position. Blank elements (a bare "", a stray comma, a
+    trailing comma, whitespace) are dropped here rather than surviving to crash a later
+    .strip() on a None -- neither flag is `required`, so both can be absent or empty."""
+    domains: list[str] = []
+    seen: set[str] = set()
+    raw_parts = ([args.domain] if args.domain else []) + (
+        args.domains.split(",") if args.domains else [])
+    for raw in raw_parts:
+        d = (raw or "").strip()
+        if d and d not in seen:
+            seen.add(d)
+            domains.append(d)
+    return domains
+
+
+def _gsb_chunk_count(n_domains: int, criteria) -> int:
+    """Mirrors GsbClient.check's own chunk math (tox_gsb_batch_size // per_domain,
+    floored at 1) so the dry-run estimate can never drift from what a real run does."""
+    if n_domains == 0:
+        return 0
+    chunk = max(1, criteria.tox_gsb_batch_size // _GSB_URLS_PER_DOMAIN)
+    return -(-n_domains // chunk)   # ceil division
+
+
 def cmd_screen(args: argparse.Namespace) -> int:
     """Phase 5b debug CLI. UNLIKE `comps`, this DOES hit the network."""
+    domains = _collect_screen_domains(args)
+    if not domains:
+        print("screen: no domains to screen - pass --domain and/or --domains with "
+              "at least one non-empty domain", file=sys.stderr)
+        return 1
     criteria = load_criteria(args.criteria)
-    domains = [d.strip() for d in (args.domains.split(",") if args.domains else [args.domain])
-               if d.strip()]
     if args.dry_run:
+        chunks = _gsb_chunk_count(len(domains), criteria)
         print(f"screen: [dry-run] would query CDX for {len(domains)} domain(s) and send "
-              f"{len(domains) * 2} URL(s) to safe-browsing in 1 batch (nothing written)")
+              f"{len(domains) * 2} URL(s) to safe-browsing in {chunks} "
+              f"batch{'es' if chunks != 1 else ''} (nothing written)")
         return 0
 
     config.load_dotenv()
@@ -1980,6 +2033,11 @@ Add `VERDICT_UNKNOWN_NO_HISTORY` to `toxicity.py`'s module namespace by re-expor
 
 - [ ] **Step 4: Register the subparser**
 
+**Post-ship correction (Task 11 review, finding 2):** the `--domain`/`--domains`
+help strings below are updated from the as-planned wording to document the
+ADDITIVE behavior fixed above -- passing both flags together used to silently
+drop `--domain`; now it is documented, tested behavior instead of a surprise.
+
 In `domainscout/__main__.py`, before the `_STUB_HELP` loop:
 
 ```python
@@ -1993,8 +2051,11 @@ In `domainscout/__main__.py`, before the `_STUB_HELP` loop:
             "are never cached, so they retry on the next run."
         ),
     )
-    p_screen.add_argument("--domain", help="a single domain, e.g. cloudvault.com")
-    p_screen.add_argument("--domains", help="comma-separated list (exercises GSB batching)")
+    p_screen.add_argument("--domain", help="a single domain, e.g. cloudvault.com "
+                          "(additive with --domains: --domain is screened first, "
+                          "duplicates dropped)")
+    p_screen.add_argument("--domains", help="comma-separated list (additive with --domain; "
+                          "exercises GSB batching). Blank/trailing entries are ignored")
     p_screen.add_argument("--criteria", default="criteria.toml",
                           help="path to criteria.toml (default: criteria.toml)")
     p_screen.add_argument("--cache-path", dest="cache_path",

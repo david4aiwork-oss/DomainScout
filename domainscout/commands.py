@@ -202,14 +202,48 @@ def cmd_comps(args: argparse.Namespace) -> int:
     return 0
 
 
+_GSB_URLS_PER_DOMAIN = 2   # http + https; must mirror GsbClient.check's own `per_domain`
+
+
+def _collect_screen_domains(args: argparse.Namespace) -> list[str]:
+    """--domain and --domains are ADDITIVE: --domain first, then --domains in order,
+    de-duplicated by first-seen position. Blank elements (a bare "", a stray comma, a
+    trailing comma, whitespace) are dropped here rather than surviving to crash a later
+    .strip() on a None -- neither flag is `required`, so both can be absent or empty."""
+    domains: list[str] = []
+    seen: set[str] = set()
+    raw_parts = ([args.domain] if args.domain else []) + (
+        args.domains.split(",") if args.domains else [])
+    for raw in raw_parts:
+        d = (raw or "").strip()
+        if d and d not in seen:
+            seen.add(d)
+            domains.append(d)
+    return domains
+
+
+def _gsb_chunk_count(n_domains: int, criteria) -> int:
+    """Mirrors GsbClient.check's own chunk math (tox_gsb_batch_size // per_domain,
+    floored at 1) so the dry-run estimate can never drift from what a real run does."""
+    if n_domains == 0:
+        return 0
+    chunk = max(1, criteria.tox_gsb_batch_size // _GSB_URLS_PER_DOMAIN)
+    return -(-n_domains // chunk)   # ceil division
+
+
 def cmd_screen(args: argparse.Namespace) -> int:
     """Phase 5b debug CLI. UNLIKE `comps`, this DOES hit the network."""
+    domains = _collect_screen_domains(args)
+    if not domains:
+        print("screen: no domains to screen - pass --domain and/or --domains with "
+              "at least one non-empty domain", file=sys.stderr)
+        return 1
     criteria = load_criteria(args.criteria)
-    domains = [d.strip() for d in (args.domains.split(",") if args.domains else [args.domain])
-               if d.strip()]
     if args.dry_run:
+        chunks = _gsb_chunk_count(len(domains), criteria)
         print(f"screen: [dry-run] would query CDX for {len(domains)} domain(s) and send "
-              f"{len(domains) * 2} URL(s) to safe-browsing in 1 batch (nothing written)")
+              f"{len(domains) * 2} URL(s) to safe-browsing in {chunks} "
+              f"batch{'es' if chunks != 1 else ''} (nothing written)")
         return 0
 
     config.load_dotenv()
