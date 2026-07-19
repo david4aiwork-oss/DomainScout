@@ -186,3 +186,72 @@ def decide(gsb: GsbResult | None, shape: HistoryShape | None,
         return (VERDICT_UNKNOWN_NO_HISTORY,
                 "no wayback captures - absence of evidence, not evidence of anything")
     return VERDICT_PASS, "not currently listed; history shape recorded"
+
+
+DEFAULT_CACHE_PATH = "data/toxicity_cache.json"
+
+
+class VerdictCache:
+    """Domain -> verdict, with per-verdict TTLs.
+
+    Two rules carry this design:
+      1. unknown_error is NEVER written. Not TTL-0 - never persisted, so a transient
+         failure cannot be configured into stickiness.
+      2. Every entry records the collapse it was computed under, and an entry whose
+         collapse differs from the current config is a MISS. That makes 'thresholds
+         are calibrated to this sampling' self-enforcing instead of a comment someone
+         has to notice."""
+
+    def __init__(self, path, *, cache_days: dict, collapse: str, now: datetime | None = None):
+        self.path = Path(path)
+        self.cache_days = cache_days
+        self.collapse = collapse
+        self.now = now or datetime.now()
+        self._entries: dict = {}
+        if self.path.is_file():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self._entries = loaded
+            except (OSError, ValueError):
+                self._entries = {}   # a corrupt cache is a COLD cache, never a crash
+
+    def get(self, domain: str) -> ToxicityVerdict | None:
+        entry = self._entries.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("collapse") != self.collapse:
+            return None
+        ttl = self.cache_days.get(entry.get("verdict", ""))
+        if ttl is None:
+            return None
+        try:
+            screened = datetime.fromisoformat(entry["screened_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (self.now - screened).days >= ttl:
+            return None
+        return ToxicityVerdict(
+            domain=domain, verdict=entry["verdict"], reason=entry.get("reason", ""),
+            gsb=None, history=None, screened_at=entry["screened_at"],
+            collapse=entry["collapse"])
+
+    def put(self, verdict: ToxicityVerdict) -> None:
+        if verdict.verdict == VERDICT_UNKNOWN_ERROR:
+            return   # see rule 1
+        self._entries[verdict.domain] = {
+            "verdict": verdict.verdict, "reason": verdict.reason,
+            "screened_at": verdict.screened_at, "collapse": verdict.collapse,
+        }
+
+    def save(self) -> None:
+        """Temp-file + os.replace. The OSError catch is not theoretical: 5a hit a real
+        Windows AV file-lock during exactly this rename."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(self._entries, indent=1, sort_keys=True),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(f"toxicity: WARNING - could not write cache {self.path}: {exc}")

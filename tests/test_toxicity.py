@@ -294,3 +294,70 @@ def test_decide_gsb_none_guards_against_null_dereference():
     verdict, reason = toxicity.decide(None, _SHAPE, ["safe-browsing: boom"])
     assert verdict == models.VERDICT_UNKNOWN_ERROR
     assert "safe-browsing: boom" in reason
+
+
+from datetime import datetime, timedelta
+
+_DAYS = {"reject": 30, "pass": 14, "unknown_no_history": 30}
+
+
+def _verdict(domain, verdict, collapse="timestamp:6", screened_at="2026-07-18T00:00:00"):
+    return models.ToxicityVerdict(domain=domain, verdict=verdict, reason="r",
+                                  gsb=_NOT_LISTED, history=None,
+                                  screened_at=screened_at, collapse=collapse)
+
+
+def test_cache_roundtrip_within_ttl(tmp_path):
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    cache.put(_verdict("a.com", models.VERDICT_PASS, screened_at=now.isoformat()))
+    cache.save()
+    reopened = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                     collapse="timestamp:6", now=now + timedelta(days=13))
+    assert reopened.get("a.com").verdict == models.VERDICT_PASS
+
+
+def test_cache_expires_past_ttl(tmp_path):
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    cache.put(_verdict("a.com", models.VERDICT_PASS, screened_at=now.isoformat()))
+    cache.save()
+    stale = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now + timedelta(days=15))
+    assert stale.get("a.com") is None
+
+
+def test_cache_never_persists_unknown_error(tmp_path):
+    """NOT a TTL of 0 - never written at all. A transient failure then CANNOT be
+    misconfigured into stickiness, which any numeric TTL eventually can."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    cache.put(_verdict("a.com", models.VERDICT_UNKNOWN_ERROR, screened_at=now.isoformat()))
+    cache.save()
+    assert cache.get("a.com") is None
+    assert "a.com" not in json.loads((tmp_path / "c.json").read_text(encoding="utf-8"))
+
+
+def test_cache_misses_when_collapse_changed(tmp_path):
+    """Self-enforcing calibration: every metric is relative to the sampling, so an
+    entry computed under a different collapse is not comparable data."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    cache.put(_verdict("a.com", models.VERDICT_PASS, collapse="timestamp:6",
+                       screened_at=now.isoformat()))
+    cache.save()
+    changed = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                    collapse="timestamp:4", now=now)
+    assert changed.get("a.com") is None
+
+
+def test_cache_tolerates_a_corrupt_file(tmp_path):
+    """A half-written cache must degrade to a cold cache, never crash the run."""
+    (tmp_path / "c.json").write_text("{not json", encoding="utf-8")
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=datetime(2026, 7, 18))
+    assert cache.get("a.com") is None

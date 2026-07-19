@@ -14,6 +14,7 @@ data/*.sqlite3
 feeds/          # downloaded daily feed files
 digests/        # generated markdown reports
 data/namebio_*  # Phase 5a NameBio comps caches (regenerable via `domainscout comps-refresh`)
+data/toxicity_cache.json   # Phase 5b verdict cache (regenerable; re-screens on miss)
 
 # --- Python ---
 __pycache__/
