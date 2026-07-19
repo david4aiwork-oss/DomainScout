@@ -160,3 +160,75 @@ def test_compute_shape_divergence_values_are_exact():
     assert shape.tail.digest_churn == 1.0                 # C, D, E all distinct
     assert shape.divergence.churn_ratio == 1.2            # 1.0 / 0.8333
     assert shape.divergence.status_shift == 0.0           # all 2xx in both windows
+
+
+def test_max_gap_years_and_distinct_years_multi_year_gap():
+    """max_gap_years silently fails if not asserted - it measures abandonment periods.
+    A 6-year gap between 2012 and 2018 must be correctly computed and distinct_years
+    must count the actual calendar years spanned."""
+    # 2010, 2011, 2012 (one per year), then gap to 2018, then 2019
+    caps = _caps([("20100115120000", "A"), ("20110115120000", "B"),
+                  ("20120115120000", "C"), ("20180115120000", "D"),
+                  ("20190115120000", "E")])
+    shape = toxicity.compute_shape(caps, tail_window_months=24, tail_min_captures=3)
+    lt = shape.lifetime
+    # max_gap: 2012-01-15 to 2018-01-15 is 2191 days = 2191/365.25 = 6.001 after rounding to 3 decimals
+    assert lt.max_gap_years == 6.001
+    assert lt.distinct_years == 5
+
+
+def test_status_mix_and_mime_mix_with_diverse_codes_and_types():
+    """status_mix and mime_mix exercise _status_bucket's bucketing and diversity.
+    If status codes are not bucketed correctly or mimetypes are miscounted, the
+    status_mix and mime_mix dicts silently carry wrong counts to downstream scoring."""
+    caps = [
+        models.Capture("20200101120000", "200", "text/html", "A"),
+        models.Capture("20200201120000", "301", "application/octet-stream", "B"),
+        models.Capture("20200301120000", "404", "warc/revisit", "C"),
+        models.Capture("20200401120000", "-", "text/plain", "D"),
+    ]
+    shape = toxicity.compute_shape(caps, tail_window_months=24, tail_min_captures=3)
+    lt = shape.lifetime
+    # status_bucket: "200" -> "2xx", "301" -> "3xx", "404" -> "4xx", "-" -> "other"
+    assert lt.status_mix == {"2xx": 1, "3xx": 1, "4xx": 1, "other": 1}
+    # mimetypes are counted as-is
+    assert lt.mime_mix == {
+        "text/html": 1,
+        "application/octet-stream": 1,
+        "warc/revisit": 1,
+        "text/plain": 1,
+    }
+
+
+def test_mime_shift_and_captures_per_year_ratio_in_divergence():
+    """mime_shift and captures_per_year_ratio are computed but never validated.
+    A text/html-to-other flip in the tail must produce negative mime_shift.
+    captures_per_year_ratio must reflect the tail's sampling density vs lifetime."""
+    # Long HTML run (2010-2020, every other year), then tail of mostly NOT-HTML
+    html_stable = [
+        (f"{y}0115120000", "HTML") for y in range(2010, 2021, 2)
+    ]  # 2010, 2012, 2014, 2016, 2018, 2020 = 6 HTML captures
+    # Tail window (24 months from last capture) covers ~2019-07 onwards
+    # Add 2021-01 and 2021-07 with non-HTML mimetypes
+    tail_flip = [
+        ("20210115120000", "FLIP1"),
+        ("20210715120000", "FLIP2"),
+    ]
+    caps_data = html_stable + tail_flip
+    caps = [
+        models.Capture(ts, "200", "text/html" if "HTML" in dg else "application/json", dg)
+        for ts, dg in caps_data
+    ]
+    shape = toxicity.compute_shape(caps, tail_window_months=24, tail_min_captures=3)
+    assert shape.divergence is not None
+    lt, tail, div = shape.lifetime, shape.tail, shape.divergence
+    # Lifetime: 8 captures (6 HTML + 2 JSON from tail_flip) -> html_prop = 6/8 = 0.75
+    assert lt.capture_count == 8
+    # Tail (24 months from 2021-07, i.e., from ~2019-07): 2020-01, 2021-01, 2021-07 = 3 captures
+    # 1 text/html (2020-01), 2 application/json -> html_prop = 1/3 ≈ 0.3333
+    assert tail.capture_count == 3
+    # mime_shift = 0.3333 - 0.75 = -0.4167, rounded to 4 decimals
+    assert div.mime_shift == -0.4167
+    # captures_per_year: lifetime ≈ 0.696, tail ≈ 2.003
+    # ratio ≈ 2.003 / 0.696 ≈ 2.8779, rounded to 4 decimals
+    assert div.captures_per_year_ratio == 2.8779
