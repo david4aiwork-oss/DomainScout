@@ -1338,7 +1338,7 @@ Expected: PASS (4 tests)
 
 ```bash
 git add domainscout/toxicity.py tests/test_toxicity.py
-git commit -m "feat(5b): CdxClient - time-bounded tail query, no server-side collapse"
+git commit -m "feat(5b): CdxClient - two matchType=exact queries per host, server-side collapse"
 ```
 
 ---
