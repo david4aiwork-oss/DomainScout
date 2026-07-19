@@ -43,7 +43,14 @@ class ToxicityKeyMissing(Exception):
 def parse_cdx(payload: list) -> list[Capture]:
     """CDX json output is [header_row, *data_rows]. Columns are read BY NAME, because
     their order follows the fl= parameter. An empty list AND a header-only response
-    both mean 'no captures' - a never-archived domain must never look like a failure."""
+    both mean 'no captures' - a never-archived domain must never look like a failure.
+
+    A row whose timestamp is not a plausible CDX moment (a '-' placeholder, a bare
+    year, anything _to_dt cannot parse) is skipped rather than allowed to raise: CDX
+    is a live third-party feed and a single malformed row is data noise, not a fatal
+    error - the same treatment already given to a too-short row below. Skipping here,
+    at the source, means every caller of parse_cdx (not just screen()) is protected,
+    rather than relying on each call site to catch _to_dt's ValueError itself."""
     if not payload:
         return []
     header, *rows = payload
@@ -57,7 +64,12 @@ def parse_cdx(payload: list) -> list[Capture]:
     for row in rows:
         if len(row) <= max(ts_i, st_i, mt_i, dg_i):
             continue
-        out.append(Capture(timestamp=str(row[ts_i]), statuscode=str(row[st_i]),
+        timestamp = str(row[ts_i])
+        try:
+            _to_dt(timestamp)
+        except ValueError:
+            continue   # malformed timestamp - noise, not a parse failure
+        out.append(Capture(timestamp=timestamp, statuscode=str(row[st_i]),
                            mimetype=str(row[mt_i]), digest=str(row[dg_i])))
     return out
 
@@ -198,21 +210,34 @@ DEFAULT_CACHE_PATH = "data/toxicity_cache.json"
 class VerdictCache:
     """Domain -> verdict, with per-verdict TTLs.
 
-    Two rules carry this design:
+    Rules that carry this design:
       1. unknown_error is NEVER written. Not TTL-0 - never persisted, so a transient
          failure cannot be configured into stickiness.
       2. Every entry records the collapse it was computed under, and an entry whose
          collapse differs from the current config is a MISS. That makes 'thresholds
          are calibrated to this sampling' self-enforcing instead of a comment someone
          has to notice.
+      3. Every entry also records the (order-independent) GSB threat-type set it was
+         screened against. Adding a threat type must invalidate up to
+         cache_days['pass'] days of verdicts computed WITHOUT it - a mismatch is a
+         MISS, exactly like a collapse mismatch. Recorded as a SORTED list so a mere
+         reordering of the config list is never mistaken for a real change.
+      4. The cache persists the FULL verdict payload - gsb and history, not just the
+         four scalars - because a cache HIT is the primary path this phase is designed
+         for (5c re-screens the same ~30 domains repeatedly; `pass` alone has a 14-day
+         TTL). A hit that reconstructed gsb=None/history=None would be indistinguishable
+         from 'the GSB leg errored', and the whole 5b deliverable (the history shape)
+         would silently vanish on every cache hit.
 
-    A third rule, added after a review finding: save() is a no-op unless put() has
+    A further rule, added after a review finding: save() is a no-op unless put() has
     actually stored something since load. See the _dirty flag below."""
 
-    def __init__(self, path, *, cache_days: dict, collapse: str, now: datetime | None = None):
+    def __init__(self, path, *, cache_days: dict, collapse: str,
+                 threat_types: Sequence[str] = (), now: datetime | None = None):
         self.path = Path(path)
         self.cache_days = cache_days
         self.collapse = collapse
+        self.threat_types = sorted(threat_types)
         self.now = now or datetime.now()
         self._entries: dict = {}
         self._dirty = False   # set by put(); save() no-ops while this is False
@@ -225,10 +250,23 @@ class VerdictCache:
                 self._entries = {}   # a corrupt cache is a COLD cache, never a crash
 
     def get(self, domain: str) -> ToxicityVerdict | None:
+        """Returns the cached verdict WITH its full gsb/history payload restored, or
+        None on any miss - expired TTL, a collapse/threat-type mismatch, or a
+        malformed/partial stored entry. A malformed entry degrades to a clean miss
+        (re-screened), never an exception, consistent with every other degradation
+        path here."""
         entry = self._entries.get(domain)
         if not isinstance(entry, dict):
             return None
         if entry.get("collapse") != self.collapse:
+            return None
+        # Missing key (a pre-FIX-4 entry, or a hand-written test fixture) defaults to
+        # [] - the SAME default self.threat_types gets when a caller doesn't pass
+        # threat_types - so an old entry is comparable to a cache opened with no
+        # explicit config, while still correctly missing against any REAL non-empty
+        # criteria.tox_gsb_threat_types (the conservative, invalidate-when-uncertain
+        # outcome an actual deploy should have).
+        if entry.get("gsb_threat_types_config", []) != self.threat_types:
             return None
         ttl = self.cache_days.get(entry.get("verdict", ""))
         if ttl is None:
@@ -239,17 +277,27 @@ class VerdictCache:
             return None
         if (self.now - screened).days >= ttl:
             return None
+        try:
+            gsb = _gsb_from_dict(entry.get("gsb"))
+            history = _shape_from_dict(entry.get("history"))
+        except (KeyError, TypeError, ValueError):
+            return None   # corrupt nested payload - treat exactly like any other miss
         return ToxicityVerdict(
             domain=domain, verdict=entry["verdict"], reason=entry.get("reason", ""),
-            gsb=None, history=None, screened_at=entry["screened_at"],
+            gsb=gsb, history=history, screened_at=entry["screened_at"],
             collapse=entry["collapse"])
 
     def put(self, verdict: ToxicityVerdict) -> None:
+        """Persists the FULL verdict - including gsb and history, not just the four
+        scalars - so a subsequent get() can restore them (see class docstring rule 4)."""
         if verdict.verdict == VERDICT_UNKNOWN_ERROR:
             return   # see rule 1 - and note: must NOT mark the cache dirty either
         self._entries[verdict.domain] = {
             "verdict": verdict.verdict, "reason": verdict.reason,
             "screened_at": verdict.screened_at, "collapse": verdict.collapse,
+            "gsb": (_gsb_to_dict(verdict.gsb) if verdict.gsb else None),
+            "history": (_shape_to_dict(verdict.history) if verdict.history else None),
+            "gsb_threat_types_config": self.threat_types,
         }
         self._dirty = True
 
@@ -302,7 +350,8 @@ class CdxClient:
     def __init__(self, client: httpx.Client, criteria, sleep=time.sleep):
         self.client = client
         self.criteria = criteria
-        self.sleep = sleep   # injected so retry tests do not actually wait out the backoff
+        self.sleep = sleep   # injected so retry/pacing tests do not actually wait
+        self._last_request_at: float | None = None   # monotonic; None until the first GET
 
     def _params(self, host: str) -> dict:
         return {
@@ -314,9 +363,26 @@ class CdxClient:
             "limit": self.criteria.tox_cdx_limit,            # runaway guard; never engages
         }
 
+    def _pace(self) -> None:
+        """Keep the SUCCESS path under tox_cdx_max_requests_per_sec too. Before this
+        fix the config value was used ONLY as the failure-path backoff divisor, so a
+        clean run issued its whole request burst with zero pacing sleeps - measured at
+        30 domains = 60 requests, 0 sleeps, 0.006s. Sleeps for whatever remains of the
+        minimum inter-request interval since the last GET, using a MONOTONIC clock (a
+        wall-clock adjustment must not corrupt the interval). Called once per attempt in
+        _get, so it also paces between retries, not just between domains."""
+        min_interval = 1.0 / max(self.criteria.tox_cdx_max_rps, 0.1)
+        now = time.monotonic()
+        if self._last_request_at is not None:
+            remaining = min_interval - (now - self._last_request_at)
+            if remaining > 0:
+                self.sleep(remaining)
+        self._last_request_at = time.monotonic()
+
     def _get(self, params: dict) -> list:
         last: Exception | None = None
         for attempt in range(self.criteria.tox_cdx_max_retries):
+            self._pace()
             try:
                 resp = self.client.get(self.criteria.tox_cdx_base_url, params=params,
                                        timeout=self.criteria.tox_cdx_timeout)
@@ -335,7 +401,12 @@ class CdxClient:
                     raise CdxError(f"CDX HTTP {resp.status_code} for {params['url']}")
             except (httpx.TransportError, ValueError) as exc:
                 last = exc
-            self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
+            # Skip the backoff sleep after the FINAL attempt: sleeping right before the
+            # loop exits and raises anyway wastes it - a full outage burned
+            # sum(min(2**a, 8) for a in range(max_retries-1)) seconds for nothing, up to
+            # 240s of a 420s worst case at the default max_retries=4-ish settings.
+            if attempt < self.criteria.tox_cdx_max_retries - 1:
+                self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
         raise CdxError(f"CDX failed after {self.criteria.tox_cdx_max_retries} attempts: {last}")
 
     def hosts(self, domain: str) -> tuple[str, str]:
@@ -359,6 +430,15 @@ class CdxClient:
                 failures.append(f"{host}: {exc}")
         if failures and not captures:
             raise CdxError(f"CDX failed for every host of {domain} - " + "; ".join(failures))
+        if failures:
+            # One host failed but the OTHER succeeded, so the domain still gets an
+            # unqualified `pass`-eligible shape from a single host - and nothing in the
+            # verdict or logs would otherwise record that half the query failed. A
+            # systematic www.-side outage would quietly thin every shape while looking
+            # perfectly healthy. Surface it; ASCII-only (this runs under Task
+            # Scheduler's redirected cp1252 stdout, same as VerdictCache.save's warning).
+            print(f"toxicity: WARNING - partial CDX failure for {domain}: "
+                  + "; ".join(failures))
         # De-dupe: the two hosts often overlap (and for some domains CDX appears to
         # canonicalize them to the same record entirely). bucket_monthly re-sorts, so
         # merge order does not matter.
@@ -504,7 +584,11 @@ def screen(domains: Sequence[str], *, cdx, gsb, criteria,
                 cdx.fetch(domain),
                 tail_window_months=criteria.tox_tail_window_months,
                 tail_min_captures=criteria.tox_tail_min_captures)
-        except CdxError as exc:
+        except (CdxError, ValueError) as exc:
+            # ValueError is defence in depth: parse_cdx already skips a malformed
+            # timestamp rather than raising, but a future path that still raises one
+            # (e.g. a _to_dt call added elsewhere) must degrade only THIS domain to
+            # unknown_error, never escape and abort verdicts for the rest of the batch.
             shapes[domain] = None
             errors[domain].append(f"cdx: {exc}")
 
@@ -571,3 +655,57 @@ def _shape_to_dict(shape: HistoryShape) -> dict:
         "tail": asdict(shape.tail) if shape.tail else None,
         "divergence": asdict(shape.divergence) if shape.divergence else None,
     }
+
+
+def _gsb_to_dict(gsb: GsbResult) -> dict:
+    """The cache-persistence counterpart of _shape_to_dict, for VerdictCache.put -
+    FIX 1: a cache hit used to reconstruct gsb=None unconditionally, discarding this
+    leg's result even though it succeeded."""
+    return {
+        "currently_listed": gsb.currently_listed,
+        "threat_types": list(gsb.threat_types),
+        "checked_at": gsb.checked_at,
+    }
+
+
+def _gsb_from_dict(data) -> GsbResult | None:
+    """Inverse of _gsb_to_dict. Raises (KeyError/TypeError) on a malformed payload -
+    callers (VerdictCache.get) must treat that as a cache MISS, never let it escape."""
+    if data is None:
+        return None
+    return GsbResult(currently_listed=bool(data["currently_listed"]),
+                     threat_types=tuple(data["threat_types"]),
+                     checked_at=data["checked_at"])
+
+
+def _block_from_dict(data: dict) -> ShapeBlock:
+    """One ShapeBlock leg of _shape_from_dict. Raises on a malformed payload (e.g. a
+    non-dict 'lifetime') - the caller treats that as a cache MISS."""
+    return ShapeBlock(
+        first_capture=data["first_capture"], last_capture=data["last_capture"],
+        span_years=data["span_years"], capture_count=data["capture_count"],
+        distinct_years=data["distinct_years"], max_gap_years=data["max_gap_years"],
+        digest_churn=data["digest_churn"], captures_per_year=data["captures_per_year"],
+        status_mix=dict(data["status_mix"]), mime_mix=dict(data["mime_mix"]))
+
+
+def _divergence_from_dict(data) -> Divergence | None:
+    if data is None:
+        return None
+    return Divergence(churn_ratio=data["churn_ratio"], status_shift=data["status_shift"],
+                      mime_shift=data["mime_shift"],
+                      captures_per_year_ratio=data["captures_per_year_ratio"])
+
+
+def _shape_from_dict(data) -> HistoryShape | None:
+    """Inverse of _shape_to_dict. HistoryShape/ShapeBlock/Divergence are FROZEN
+    dataclasses, so this constructs fresh instances rather than mutating anything.
+    Raises (KeyError/TypeError) on a malformed payload - VerdictCache.get catches that
+    and treats it as a clean cache MISS, consistent with every other degradation path
+    there (never a crash, never a half-built shape)."""
+    if data is None:
+        return None
+    lifetime = _block_from_dict(data["lifetime"])
+    tail = _block_from_dict(data["tail"]) if data.get("tail") is not None else None
+    divergence = _divergence_from_dict(data.get("divergence"))
+    return HistoryShape(lifetime=lifetime, tail=tail, divergence=divergence)

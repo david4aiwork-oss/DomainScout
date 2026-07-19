@@ -90,6 +90,20 @@ def test_parse_cdx_skips_short_rows_and_parses_valid_ones():
     assert caps[0].digest == "ABC"
 
 
+def test_parse_cdx_skips_rows_with_malformed_timestamp():
+    """FIX 2: _to_dt raises ValueError on any timestamp that is not a real CDX moment.
+    A bare year (ljust-padded to month '00') and a '-' placeholder (a real CDX
+    placeholder seen in other columns) are both data noise, not fatal - skip the row
+    and keep the good ones, exactly like the existing too-short-row handling."""
+    payload = [["timestamp", "statuscode", "mimetype", "digest"],
+               ["2020", "200", "text/html", "BADYEAR"],        # pads to month '00'
+               ["-", "200", "text/html", "DASH"],               # non-digit placeholder
+               ["20200120120000", "200", "text/html", "GOOD"]]  # valid
+    caps = toxicity.parse_cdx(payload)
+    assert len(caps) == 1
+    assert caps[0].digest == "GOOD"
+
+
 def _caps(pairs):
     """pairs: [(timestamp, digest)] -> captures, all 200/text/html."""
     return [models.Capture(ts, "200", "text/html", dg) for ts, dg in pairs]
@@ -363,6 +377,40 @@ def test_cache_misses_when_collapse_changed(tmp_path):
     assert changed.get("a.com") is None
 
 
+def test_cache_misses_when_threat_types_changed(tmp_path):
+    """FIX 4: adding a GSB threat type leaves up to cache_days['pass'] (14) days of
+    `pass` verdicts computed WITHOUT it. An entry's recorded threat-type set must be
+    validated on read, exactly like collapse - a mismatch is a MISS."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6",
+                                  threat_types=("MALWARE", "SOCIAL_ENGINEERING"), now=now)
+    cache.put(_verdict("a.com", models.VERDICT_PASS, screened_at=now.isoformat()))
+    cache.save()
+    changed = toxicity.VerdictCache(
+        tmp_path / "c.json", cache_days=_DAYS, collapse="timestamp:6",
+        threat_types=("MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"), now=now)
+    assert changed.get("a.com") is None
+
+
+def test_cache_hit_survives_threat_types_reordering(tmp_path):
+    """tail_window_months/tail_min_captures are correctly NOT validated (they only
+    affect HistoryShape, which decide() reads via `shape is None`, independent of their
+    values) - but the threat-type set IS, and it must be stored order-independently so
+    a reordering of criteria.toml's list is never mistaken for a real change."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6",
+                                  threat_types=("MALWARE", "SOCIAL_ENGINEERING"), now=now)
+    cache.put(_verdict("a.com", models.VERDICT_PASS, screened_at=now.isoformat()))
+    cache.save()
+    reordered = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                      collapse="timestamp:6",
+                                      threat_types=("SOCIAL_ENGINEERING", "MALWARE"), now=now)
+    got = reordered.get("a.com")
+    assert got is not None and got.verdict == models.VERDICT_PASS
+
+
 def test_cache_tolerates_a_corrupt_file(tmp_path):
     """A half-written cache must degrade to a cold cache, never crash the run."""
     (tmp_path / "c.json").write_text("{not json", encoding="utf-8")
@@ -461,6 +509,67 @@ def test_cache_reason_survives_roundtrip(tmp_path):
     assert retrieved.reason == distinctive_reason
 
 
+def test_cache_roundtrip_preserves_full_gsb_and_history(tmp_path):
+    """FIX 1: get() used to reconstruct gsb=None and history=None unconditionally on
+    EVERY hit, discarding this phase's whole deliverable the moment a verdict was
+    served from cache instead of freshly computed. Round-trip a REJECT verdict (the
+    hard-reject leg, most damaging to get wrong) carrying a populated multi-threat
+    GsbResult and a full tail+divergence HistoryShape, and assert every nested field
+    survives save + reopen intact - not just the four original scalars."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    now = datetime(2026, 7, 18)
+    stable = [(f"{y}{m:02d}15120000", "SAME") for y in range(2010, 2020) for m in (1, 7)]
+    churny = [(f"2020{m:02d}15120000", f"FLIP{m}") for m in range(1, 13)]
+    shape = toxicity.compute_shape(_caps(stable + churny),
+                                   tail_window_months=24, tail_min_captures=3)
+    assert shape.tail is not None and shape.divergence is not None   # sanity pre-cache
+
+    gsb = models.GsbResult(True, ("MALWARE", "SOCIAL_ENGINEERING"), "2026-07-18T00:00:00")
+    verdict = models.ToxicityVerdict(
+        domain="a.com", verdict=models.VERDICT_REJECT, reason="safe-browsing listed",
+        gsb=gsb, history=shape, screened_at=now.isoformat(), collapse=crit.tox_cdx_collapse)
+
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse=crit.tox_cdx_collapse,
+                                  threat_types=crit.tox_gsb_threat_types, now=now)
+    cache.put(verdict)
+    cache.save()
+
+    reopened = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                     collapse=crit.tox_cdx_collapse,
+                                     threat_types=crit.tox_gsb_threat_types, now=now)
+    got = reopened.get("a.com")
+    assert got is not None
+    assert got.gsb.currently_listed is True
+    assert got.gsb.threat_types == ("MALWARE", "SOCIAL_ENGINEERING")
+    assert got.gsb.checked_at == "2026-07-18T00:00:00"
+    assert got.history is not None
+    assert got.history.lifetime == shape.lifetime
+    assert got.history.tail == shape.tail
+    assert got.history.divergence == shape.divergence
+
+
+def test_cache_corrupt_history_subdict_is_a_clean_miss_not_a_crash(tmp_path):
+    """FIX 1 test (c): a hand-edited or future-format cache entry with a corrupt nested
+    'history' block must degrade to a clean MISS (re-screened), never raise - every
+    other degradation path in get() already behaves this way."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    cache_file = tmp_path / "c.json"
+    cache_file.write_text(json.dumps({
+        "a.com": {
+            "verdict": "pass", "reason": "r",
+            "screened_at": "2026-07-18T00:00:00", "collapse": "timestamp:6",
+            "gsb": None,
+            "history": {"lifetime": "nonsense"},
+            "gsb_threat_types_config": sorted(crit.tox_gsb_threat_types),
+        }
+    }), encoding="utf-8")
+    cache = toxicity.VerdictCache(cache_file, cache_days=_DAYS, collapse="timestamp:6",
+                                  threat_types=crit.tox_gsb_threat_types,
+                                  now=datetime(2026, 7, 18))
+    assert cache.get("a.com") is None
+
+
 import httpx
 
 
@@ -515,6 +624,28 @@ def test_cdx_client_one_host_failing_does_not_fail_the_domain():
     assert [c.digest for c in caps] == ["A"]
 
 
+def test_cdx_client_partial_host_failure_logs_a_warning(capsys):
+    """FIX 5: a partial failure (one host down, the other up) used to be silently
+    dropped - the verdict came back an unqualified pass-eligible shape from a single
+    host with nothing in reason or any log recording that half the query failed. A
+    systematic www.-side outage would quietly thin every shape while looking healthy.
+    Must still return the good host's captures."""
+    def handler(request):
+        if request.url.params["url"].startswith("www."):
+            return httpx.Response(503)
+        return httpx.Response(200, json=[["timestamp", "statuscode", "mimetype", "digest"],
+                                         ["20200115120000", "200", "text/html", "A"]])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    caps = toxicity.CdxClient(_fake_client(handler), crit,
+                              sleep=lambda s: None).fetch("example.com")
+    assert [c.digest for c in caps] == ["A"]          # good host's data still returned
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "example.com" in out
+    assert "www.example.com" in out
+
+
 def test_cdx_client_raises_cdx_error_on_timeout():
     """Must raise, not return []. An empty list means 'never archived' - a completely
     different verdict from 'we could not reach the archive'."""
@@ -550,6 +681,65 @@ def test_cdx_client_raises_on_5xx_after_retries():
     # domain is declared a failure.
     assert calls["n"] == crit.tox_cdx_max_retries * 2
     assert slept and all(s > 0 for s in slept)          # real backoff, just not real waiting
+
+
+def test_cdx_client_paces_the_success_path():
+    """FIX 3: cdx_max_requests_per_sec previously paced ONLY the failure-path backoff
+    divisor - a clean run issued its whole request burst with zero pacing sleeps
+    (measured: 30 domains = 60 requests, 0 sleeps, 0.006s). Every GET after the very
+    first must now sleep for whatever remains of the minimum inter-request interval."""
+    slept = []
+
+    def handler(request):
+        return httpx.Response(200, json=[])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    crit = dataclasses.replace(crit, tox_cdx_max_rps=1.0)
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=slept.append)
+    client.fetch("a.com")   # 2 GETs (apex + www.)
+    client.fetch("b.com")   # 2 more GETs
+    # 4 GETs total; pacing sleeps before every GET except the very first ever issued.
+    assert len(slept) == 3
+    assert all(0 < s <= 1.0 + 1e-6 for s in slept)
+
+
+def test_cdx_client_pacing_is_negligible_at_a_very_high_rate():
+    """With the rate cranked far above what the test can meaningfully measure elapsed
+    time against, pacing must not meaningfully sleep."""
+    slept = []
+
+    def handler(request):
+        return httpx.Response(200, json=[])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    crit = dataclasses.replace(crit, tox_cdx_max_rps=1_000_000_000.0)
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=slept.append)
+    client.fetch("a.com")
+    client.fetch("b.com")
+    assert all(s < 0.001 for s in slept)   # vacuously true if pacing never even sleeps
+
+
+def test_cdx_client_retry_skips_backoff_sleep_after_the_final_attempt():
+    """FIX 6: the retry loop used to sleep after EVERY attempt including the last, right
+    before the loop exits and raises - wasted time in a full outage. Isolate this from
+    FIX 3's pacing sleeps by setting max_rps astronomically high so pacing's own
+    remaining-interval sleep never fires; every sleep recorded here is then
+    unambiguously a backoff sleep, called directly on _get (not fetch, which would
+    double the count across two hosts)."""
+    calls = {"n": 0}
+    slept = []
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(503)
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    crit = dataclasses.replace(crit, tox_cdx_max_retries=4, tox_cdx_max_rps=1_000_000_000.0)
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=slept.append)
+    with pytest.raises(toxicity.CdxError):
+        client._get(client._params("example.com"))
+    assert calls["n"] == 4
+    assert len(slept) == 3          # N-1 backoff sleeps; none after the final attempt
 
 
 def test_cdx_client_one_host_404_does_not_fail_the_domain():
@@ -782,6 +972,21 @@ def test_screen_listed_domain_is_rejected_and_skips_nothing_else():
     assert v.verdict == models.VERDICT_REJECT
 
 
+def test_screen_one_domain_raising_valueerror_does_not_kill_the_whole_batch():
+    """FIX 2: screen()'s per-domain try used to catch ONLY CdxError, so any path that
+    raised a bare ValueError (parse_cdx now guards against a malformed timestamp doing
+    this, but a future path might not) would escape uncaught and abort verdicts for
+    every OTHER domain in the batch too - and since cmd_screen has no except clause,
+    it would surface as a raw CLI traceback. Widening the catch to
+    (CdxError, ValueError) must degrade only the bad domain to unknown_error."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    cdx = _FakeCdx({"bad.com": ValueError("boom"), "good.com": []})
+    out = toxicity.screen(["bad.com", "good.com"], cdx=cdx, gsb=_FakeGsb(), criteria=crit)
+    by_domain = {v.domain: v for v in out}
+    assert by_domain["bad.com"].verdict == models.VERDICT_UNKNOWN_ERROR
+    assert by_domain["good.com"].verdict == models.VERDICT_UNKNOWN_NO_HISTORY
+
+
 def test_screen_cache_hit_skips_both_legs_and_the_gsb_batch(tmp_path):
     """A live cache hit must cost NO network on either leg, and the domain must not
     even appear in the GSB batch."""
@@ -960,3 +1165,63 @@ def test_verdict_json_full_history_shape_round_trips_with_populated_tail_and_div
 
     blob = raw.lower()
     assert "clean" not in blob and '"safe"' not in blob
+
+
+def test_verdict_json_equivalent_on_cache_miss_and_subsequent_cache_hit(tmp_path):
+    """FIX 1, the reproduction: run 1 (a cache miss) emits a full `history` block, but
+    a cache hit used to reconstruct gsb=None/history=None - so run 2's JSON for the
+    SAME domain went from a populated history to `"history":null,
+    "gsb_currently_listed":null`, even though `reason` still claimed 'history shape
+    recorded'. verdict_to_json's output must be equivalent across a miss and the
+    subsequent hit for the same domain."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    now = datetime(2026, 7, 18)
+    caps = [models.Capture(f"20{y:02d}0115120000", "200", "text/html", f"D{y}")
+            for y in range(10, 21)]
+    cache_path = tmp_path / "c.json"
+
+    cache1 = toxicity.VerdictCache(cache_path, cache_days=_DAYS,
+                                   collapse=crit.tox_cdx_collapse,
+                                   threat_types=crit.tox_gsb_threat_types, now=now)
+    miss = toxicity.screen(["a.com"], cdx=_FakeCdx({"a.com": caps}), gsb=_FakeGsb(),
+                           criteria=crit, cache=cache1, now=now)[0]
+    miss_payload = json.loads(toxicity.verdict_to_json(miss))
+    assert miss_payload["history"] is not None            # sanity: run 1 really has a shape
+
+    later = now + timedelta(days=1)   # still within the 14-day `pass` TTL
+    cache2 = toxicity.VerdictCache(cache_path, cache_days=_DAYS,
+                                   collapse=crit.tox_cdx_collapse,
+                                   threat_types=crit.tox_gsb_threat_types, now=later)
+    hit = toxicity.screen(["a.com"], cdx=_FakeCdx({}), gsb=_FakeGsb(),
+                          criteria=crit, cache=cache2, now=later)[0]
+    hit_payload = json.loads(toxicity.verdict_to_json(hit))
+
+    assert hit_payload["history"] == miss_payload["history"]
+    assert hit_payload["gsb_currently_listed"] == miss_payload["gsb_currently_listed"]
+    assert hit_payload["gsb_threat_types"] == miss_payload["gsb_threat_types"]
+    assert hit_payload["reason"] == miss_payload["reason"]
+
+
+@pytest.mark.skip(reason="live network + API key - run manually against archive.org + Safe Browsing")
+def test_live_screen_smoke():
+    """Real CDX + real Safe Browsing (5a's test_live_smoke_refresh_and_lookup / rdap's
+    test_live_smoke_known_registered_and_available precedent). Asserts the invariants
+    that matter against reality, not fakes: a long-lived, heavily-crawled domain yields
+    a populated HistoryShape, and an invented never-registered name yields
+    unknown_no_history - NOT pass, per invariant 1 (absence of evidence is not
+    evidence of cleanliness)."""
+    from domainscout import config, ingest
+    config.load_dotenv()
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = ingest.make_client(timeout=60.0)
+    try:
+        gsb = toxicity.GsbClient.from_env(client, crit)
+        out = toxicity.screen(
+            ["cnn.com", "qzxkvbnmplkjhgfd.com"],
+            cdx=toxicity.CdxClient(client, crit), gsb=gsb, criteria=crit)
+    finally:
+        client.close()
+    by_domain = {v.domain: v for v in out}
+    assert by_domain["cnn.com"].history is not None
+    assert by_domain["cnn.com"].history.lifetime.span_years > 10
+    assert by_domain["qzxkvbnmplkjhgfd.com"].verdict == models.VERDICT_UNKNOWN_NO_HISTORY

@@ -1131,6 +1131,36 @@ just `screen()`. See `tests/test_toxicity.py::test_screen_all_cache_hits_never_t
 `::test_screen_new_verdict_triggers_a_cache_write`, and
 `::test_cache_put_of_only_unknown_error_leaves_cache_clean`.
 
+**Final-review correction (2026-07-19, FIX 1 + FIX 4):** two further defects found in a
+whole-branch review, both fixed in the same pass. **FIX 1:** `get()` reconstructed
+`gsb=None, history=None` unconditionally on EVERY cache hit, discarding this phase's
+entire deliverable the moment a verdict was served from cache rather than freshly
+computed - and since `pass` has a 14-day TTL and 5c re-screens the same ~30 domains
+repeatedly, the cache-hit path is the PRIMARY path, not an edge case. `put()` now
+also serializes `gsb` (via a new `_gsb_to_dict`) and `history` (via the existing
+`_shape_to_dict`) into the stored entry; `get()` reconstructs them via new
+`_gsb_from_dict`/`_shape_from_dict`/`_block_from_dict`/`_divergence_from_dict`
+helpers, treating any malformed/partial nested payload as a clean MISS
+(`except (KeyError, TypeError, ValueError): return None`), never a crash - consistent
+with every other degradation path already in `get()`. **FIX 4:** `get()` validated
+`collapse` but not the configured GSB threat-type list, so adding a threat type left
+existing `pass` verdicts cached for up to 14 more days as if the new type didn't
+exist. `VerdictCache` now takes a `threat_types: Sequence[str] = ()` constructor
+argument, stores it (sorted, so config-list reordering is never mistaken for a real
+change) as `gsb_threat_types_config` on each entry, and misses when it differs from
+the reading instance's current value - `entry.get("gsb_threat_types_config", [])`,
+so a legacy entry missing the key entirely defaults to `[]`, matching the default a
+caller gets when it doesn't pass `threat_types` (this keeps existing hand-written
+cache-fixture tests behaving as before, while a REAL non-empty
+`criteria.tox_gsb_threat_types` still correctly misses against it). `cmd_screen` in
+`commands.py` now passes `threat_types=criteria.tox_gsb_threat_types` when
+constructing its `VerdictCache`. See
+`tests/test_toxicity.py::test_cache_roundtrip_preserves_full_gsb_and_history`,
+`::test_verdict_json_equivalent_on_cache_miss_and_subsequent_cache_hit`,
+`::test_cache_corrupt_history_subdict_is_a_clean_miss_not_a_crash`,
+`::test_cache_misses_when_threat_types_changed`, and
+`::test_cache_hit_survives_threat_types_reordering`.
+
 - [ ] **Step 4: Add the gitignore entry**
 
 In `.gitignore`, below the `data/namebio_*` line:
@@ -1376,6 +1406,34 @@ aborting before the second host was ever tried. The code block above already ref
 the fix: explicit status handling (`>= 500` or `429` retryable, `200` parses and
 returns, anything else raises `CdxError` immediately without burning the retry budget
 or sleeping).
+
+**Final-review correction (2026-07-19, FIX 3 + FIX 5 + FIX 6):** three further defects
+found in a whole-branch review, all fixed in the same pass. **FIX 3:**
+`cdx_max_requests_per_sec` was used ONLY as the failure-path backoff divisor, so a
+clean run issued its whole request burst with zero pacing sleeps - measured at 30
+domains = 60 requests, 0 sleeps, 0.006s, an unpaced burst that is exactly what would
+discover the archive.org rate-limit boundary the spike explicitly left
+uncharacterized. `CdxClient` now tracks `self._last_request_at` (a monotonic
+timestamp) and a new `_pace()` method, called at the top of every `_get` attempt,
+sleeps for whatever remains of `1.0 / max(tox_cdx_max_rps, 0.1)` since the last GET -
+paced with the same injected `self.sleep` the retry backoff already used, so tests
+stay fast. **FIX 5:** in `fetch()`, if one host succeeded and the other raised, the
+failure was silently dropped - the domain got an unqualified `pass`-eligible shape
+from a single host with nothing in `reason` or any log recording that half the query
+failed. `fetch()` now prints an ASCII `toxicity: WARNING - partial CDX failure for
+{domain}: ...` naming the domain and the failed host(s) whenever `failures` is
+non-empty but the domain still got SOME captures, without changing `fetch()`'s return
+type. **FIX 6:** the retry loop in `_get` slept after EVERY attempt including the
+final one, right before the loop exited and raised anyway - in a full archive.org
+outage that wasted `sum(min(2**a, 8) for a in range(max_retries - 1))` seconds for
+nothing. The backoff sleep is now skipped when `attempt == tox_cdx_max_retries - 1`.
+See `tests/test_toxicity.py::test_cdx_client_paces_the_success_path`,
+`::test_cdx_client_pacing_is_negligible_at_a_very_high_rate`,
+`::test_cdx_client_partial_host_failure_logs_a_warning`, and
+`::test_cdx_client_retry_skips_backoff_sleep_after_the_final_attempt` (the last two
+tests deliberately isolate FIX 6's backoff sleeps from FIX 3's pacing sleeps by
+setting `tox_cdx_max_rps` astronomically high so pacing itself never fires, leaving
+every recorded sleep unambiguously a backoff sleep).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1847,6 +1905,20 @@ nothing changed, for every caller. Also added a populated-`tail`/`divergence` te
 since the only prior test of that JSON shape always fed a zero-capture CDX fake and so never
 exercised `_shape_to_dict`'s populated branch.
 
+**Final-review correction (2026-07-19, FIX 2):** `screen()`'s per-domain CDX `try` caught
+only `CdxError`, but `parse_cdx` applied zero validation to the raw CDX timestamp field
+and `_to_dt` raises a bare `ValueError` on anything it cannot parse (a `"-"` CDX
+placeholder, a bare year padding out to an invalid month). Reproduced: a 30-domain
+batch with one malformed row killed EVERY domain's verdict, and since `cmd_screen` has
+a `try/finally` with no `except`, it surfaced as a raw CLI traceback. Fixed at both
+layers: `parse_cdx` (Task 4) now skips any row whose timestamp `_to_dt` cannot parse,
+treating it as data noise exactly like the existing too-short-row skip; and `screen()`'s
+catch here widened to `(CdxError, ValueError)` as defence in depth, so a future path
+that still raises a bare `ValueError` degrades only that one domain to `unknown_error`
+instead of escaping the loop and aborting the whole batch. See
+`tests/test_toxicity.py::test_parse_cdx_skips_rows_with_malformed_timestamp` and
+`::test_screen_one_domain_raising_valueerror_does_not_kill_the_whole_batch`.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_toxicity.py -q`
@@ -2069,6 +2141,13 @@ In `domainscout/__main__.py`, before the `_STUB_HELP` loop:
     p_screen.set_defaults(func=commands.cmd_screen)
 ```
 
+**Final-review correction (2026-07-19, FIX 4):** `cmd_screen`'s `VerdictCache(...)`
+construction now also passes `threat_types=criteria.tox_gsb_threat_types`, so the CLI's
+cache correctly participates in the Task-7 threat-type invalidation fix - without this,
+`cmd_screen` would always construct its cache with the default empty threat-type list,
+making the real config's threat types never actually validated on the one path that
+matters in production.
+
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_cli.py -q -k "screen"`
@@ -2118,6 +2197,18 @@ def test_live_screen_smoke():
     assert out[0].history is not None and out[0].history.lifetime.span_years > 10
     assert out[1].verdict == models.VERDICT_UNKNOWN_NO_HISTORY
 ```
+
+**Final-review correction (2026-07-19, FIX 7):** this step was never actually taken when
+5b originally shipped - `tests/test_toxicity.py` carried no live smoke, unlike
+`test_rdap.py` and `test_comps.py`, each of which has one. A whole-branch review caught
+the gap and added `test_live_screen_smoke`, following the same shape as the block above
+with two adjustments: it drops the Google-malware-test-URL assertion (§Testing's table
+only requires the two CDX-side invariants - a long-lived domain yields a shape, an
+invented name yields `unknown_no_history`, not `pass`), and it constructs
+`toxicity.GsbClient.from_env(client, crit)` as a separate local so the CDX client and
+the GSB client are visibly built from the same underlying `httpx.Client`. Still
+skip-marked, still requires `GOOGLE_SAFE_BROWSING_API_KEY` in `.env`, still never
+runs in CI.
 
 - [ ] **Step 2: Run the live confirmation by hand**
 

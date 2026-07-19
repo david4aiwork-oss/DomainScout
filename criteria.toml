@@ -109,7 +109,12 @@ cdx_match_type = "exact"         # MEASURED 2026-07-18 (spike, see PHASE-5B-SPIK
 cdx_limit = 5000                 # Never engages under the ratified strategy - the worst-case domain
                                  # measured collapses to 311 rows. Kept as a runaway guard only.
 cdx_timeout = 20.0
-cdx_max_requests_per_sec = 1.0
+cdx_max_requests_per_sec = 1.0   # paces BOTH the success path and the failure-path backoff
+                                 # divisor (final-review fix: before it paced only the
+                                 # latter, so a clean run issued its whole request burst -
+                                 # measured 30 domains = 60 requests - with zero pacing
+                                 # sleeps). CdxClient._pace() sleeps for whatever remains
+                                 # of 1/rps since the last GET, using a monotonic clock.
 cdx_max_retries = 3
 tail_window_months = 24          # the late-life flip window, anchored on last_capture
 tail_min_captures = 3            # below this, divergence is None rather than noise
@@ -119,6 +124,12 @@ gsb_batch_size = 250             # API cap is 500 URLs; we send 2 schemes x doma
 gsb_timeout = 15.0
 gsb_threat_types = ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE",
                     "POTENTIALLY_HARMFUL_APPLICATION"]
+                                          # final-review fix: VerdictCache now records this
+                                          # list (sorted, order-independent) per entry and
+                                          # MISSES on a mismatch, exactly like `collapse` -
+                                          # adding a threat type here invalidates up to
+                                          # cache_days.pass (14d) of verdicts computed
+                                          # without it, rather than leaving them stale.
 gsb_platform_types = ["ANY_PLATFORM"]     # v4 REQUIRES all three lists. An empty or omitted list
 gsb_threat_entry_types = ["URL"]          # returns NO MATCHES rather than erroring - a silent
                                           # false-clean, exactly the failure invariant 2 exists to

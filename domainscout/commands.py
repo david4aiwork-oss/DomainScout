@@ -258,7 +258,8 @@ def cmd_screen(args: argparse.Namespace) -> int:
         if not args.no_cache:
             cache = toxicity.VerdictCache(
                 args.cache_path or toxicity.DEFAULT_CACHE_PATH,
-                cache_days=criteria.tox_cache_days, collapse=criteria.tox_cdx_collapse)
+                cache_days=criteria.tox_cache_days, collapse=criteria.tox_cdx_collapse,
+                threat_types=criteria.tox_gsb_threat_types)
         verdicts = toxicity.screen(domains, cdx=toxicity.CdxClient(client, criteria),
                                    gsb=gsb, criteria=criteria, cache=cache)
     finally:
