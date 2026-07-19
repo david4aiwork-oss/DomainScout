@@ -49,3 +49,38 @@ def test_bucket_monthly_sorts_by_time_first():
             models.Capture("20200115120000", "200", "text/html", "A")]
     assert [c.timestamp for c in toxicity.bucket_monthly(caps)] == \
            ["20200115120000", "20220301120000"]
+
+
+def test_bucket_monthly_keeps_the_earliest_capture_in_a_month():
+    """When two captures fall in the SAME month but arrive out of chronological order,
+    the sort ensures the earliest one survives the dedup, not whichever came first in
+    the (unordered) input - critical because merged queries can have same-month captures."""
+    caps = [models.Capture("20200120120000", "200", "text/html", "LATE"),
+            models.Capture("20200105120000", "200", "text/html", "EARLY")]
+    kept = toxicity.bucket_monthly(caps)
+    assert len(kept) == 1
+    assert kept[0].digest == "EARLY"
+
+
+def test_bucket_monthly_year_boundary_keeps_decembers_distinct():
+    """Year boundaries matter: Dec 2020, Jan 2021, and Dec 2021 are three distinct
+    calendar months. Bucketing on timestamp[:6] (YYYYMM) correctly keeps all three;
+    a future edit to month-only slice like timestamp[4:6] would conflate Decembers."""
+    caps = [models.Capture("20201215120000", "200", "text/html", "DEC20"),
+            models.Capture("20210105120000", "200", "text/html", "JAN21"),
+            models.Capture("20211205120000", "200", "text/html", "DEC21")]
+    kept = toxicity.bucket_monthly(caps)
+    assert len(kept) == 3
+    assert [c.digest for c in kept] == ["DEC20", "JAN21", "DEC21"]
+
+
+def test_parse_cdx_skips_short_rows_and_parses_valid_ones():
+    """Malformed or truncated CDX rows (too few columns) must be skipped cleanly
+    without raising an exception or adding incomplete Capture objects to the output."""
+    payload = [["timestamp", "statuscode", "mimetype", "digest"],
+               ["20200115120000", "200", "text/html"],  # too short - missing digest
+               ["20200120120000", "200", "text/html", "ABC"]]  # valid
+    caps = toxicity.parse_cdx(payload)
+    assert len(caps) == 1
+    assert caps[0].timestamp == "20200120120000"
+    assert caps[0].digest == "ABC"
