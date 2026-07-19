@@ -1653,7 +1653,50 @@ def test_verdict_json_names_the_gsb_field_currently_listed():
     blob = json.dumps(payload).lower()
     assert "clean" not in blob and '"safe"' not in blob
     assert payload["collapse"] == crit.tox_cdx_collapse
+
+
+class _FakePartialGsb:
+    """Simulates GsbClient.check()'s post-Task-9-fix contract directly: a partially
+    failed batch returns a dict that OMITS the domains whose chunk failed, WITHOUT
+    raising (check() only raises when every chunk failed). This is what screen() sees
+    on a real partial GSB outage, and is not exercised by _FakeGsb above, which only
+    ever fully succeeds or fully raises."""
+    def __init__(self, omit): self.omit = set(omit); self.calls = []
+    def check(self, domains):
+        self.calls.append(list(domains))
+        return {d: models.GsbResult(False, (), "2026-07-18")
+                for d in domains if d not in self.omit}
+
+
+def test_screen_gsb_partial_chunk_failure_marks_only_that_domain_unknown_error():
+    """One chunk failed -> that domain is unknown_error while a domain from the
+    succeeded chunk keeps its result. This is the false-negative guard one layer up
+    from Task 9's: if screen() read a missing gsb_results entry as `result = None` and
+    passed it straight to decide() with no error appended, decide(None, shape, [])
+    would return pass or unknown_no_history for a.com - a domain GSB never actually
+    screened. b.com's chunk succeeded, so its real (not-listed) GsbResult must ride
+    through untouched, exactly as the existing gsb-ok/cdx-error test proves for the
+    other leg."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    gsb = _FakePartialGsb(omit=["a.com"])   # a.com's chunk failed; b.com's succeeded
+    out = toxicity.screen(["a.com", "b.com"], cdx=_FakeCdx({}), gsb=gsb, criteria=crit)
+    by_domain = {v.domain: v for v in out}
+    assert by_domain["a.com"].verdict == models.VERDICT_UNKNOWN_ERROR
+    assert by_domain["a.com"].gsb is None
+    assert by_domain["b.com"].gsb is not None
+    assert by_domain["b.com"].gsb.currently_listed is False
 ```
+
+**Note on the GSB partial-failure contract (added post-Task-9-review):** `GsbClient.check()`
+was fixed in Task 9's review pass to never pre-populate a domain as not-listed until its chunk
+has actually succeeded — a domain whose chunk raised `GsbError` is simply absent from the
+returned dict, and `check()` itself raises only when *every* chunk failed. `screen()`'s GSB
+block (Step 3 below) must honor that: a domain missing from `gsb_results` after a *successful*
+(non-raising) `gsb.check(pending)` call means "GSB never checked this domain," and must be
+pushed into that domain's `errors` list so `decide()` returns `unknown_error` — never silently
+falls through to `pass` or `unknown_no_history`. This is exactly the same false-negative trap
+one layer up: on the hard-reject leg, "we don't know" must never be indistinguishable from
+"we checked and it's fine."
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1697,8 +1740,15 @@ def screen(domains: Sequence[str], *, cdx, gsb, criteria,
             shapes[domain] = None
             errors[domain].append(f"cdx: {exc}")
 
-    # GSB second, one batched call. A batch failure marks every pending domain -
-    # but their CDX shapes SURVIVE (verdict = worst leg, data = every leg that worked).
+    # GSB second, one batched call. GsbClient.check() (Task 9, fixed post-review) raises
+    # GsbError only when EVERY chunk failed; a PARTIAL chunk failure instead returns a
+    # dict that simply OMITS the domains whose chunk failed - it does not raise in that
+    # case. Either way, a domain missing from gsb_results must become an error here, NOT
+    # a silent pass: absence means "GSB never checked this domain," never "checked, not
+    # listed." Skipping this second loop - e.g. leaving `result = gsb_results.get(domain)`
+    # as None with no error appended - would let decide(None, shape, []) return pass (or
+    # unknown_no_history) for a domain GSB never actually screened: a false negative on
+    # the hard-reject leg, exactly the failure mode Task 9's fix exists to prevent.
     gsb_results: dict = {}
     if pending:
         try:
@@ -1706,6 +1756,12 @@ def screen(domains: Sequence[str], *, cdx, gsb, criteria,
         except GsbError as exc:
             for domain in pending:
                 errors[domain].append(f"safe-browsing: {exc}")
+        else:
+            for domain in pending:
+                if domain not in gsb_results:
+                    errors[domain].append(
+                        "safe-browsing: not checked (its GSB chunk failed - see "
+                        "GsbClient.check)")
 
     for domain in pending:
         result = gsb_results.get(domain)

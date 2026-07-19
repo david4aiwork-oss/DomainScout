@@ -376,17 +376,44 @@ class GsbClient:
         return cls(client, criteria, key)
 
     def check(self, domains: Sequence[str]) -> dict:
+        """Returns a GsbResult ONLY for domains whose chunk was successfully checked.
+
+        A domain ABSENT from the returned dict was NEVER CHECKED - callers must read
+        that as "unknown", never as "not listed". This matters because chunk failures
+        are partial: if chunk 2 of N raises GsbError, chunks 1..N (other than 2) still
+        return their real results, mirroring CdxClient.fetch's "one host failing does
+        NOT fail the domain" rule. The tempting shortcut - keep pre-populating every
+        domain as not-listed up front, then just wrap _find in try/except - would leave
+        the failed chunk's domains sitting in the dict with a not-listed GsbResult they
+        never earned: a false negative on the one leg here that is a HARD reject, i.e.
+        the single most damaging failure mode this client has. So the dict is built up
+        chunk-by-chunk instead, and a chunk that raises contributes nothing.
+
+        Raises GsbError only when EVERY chunk failed (we then genuinely know nothing).
+        If at least one chunk succeeded, the partial dict is returned instead of
+        raising - the caller (screen()) is responsible for treating any domain missing
+        from this dict as an error, not as a pass."""
         checked_at = datetime.now().isoformat(timespec="seconds")
-        results = {d: GsbResult(False, (), checked_at) for d in domains}
         if not domains:
-            return results
+            return {}
         per_domain = 2                      # http + https
         chunk = max(1, self.criteria.tox_gsb_batch_size // per_domain)
+        domains = list(domains)
+        results: dict = {}
+        failures: list[str] = []
         for start in range(0, len(domains), chunk):
-            batch = list(domains)[start:start + chunk]
-            hits = self._find(batch)
+            batch = domains[start:start + chunk]
+            try:
+                hits = self._find(batch)
+            except GsbError as exc:
+                failures.append(str(exc))
+                continue
+            for domain in batch:
+                results[domain] = GsbResult(False, (), checked_at)
             for domain, threats in hits.items():
                 results[domain] = GsbResult(True, tuple(sorted(threats)), checked_at)
+        if failures and not results:
+            raise GsbError(f"safe-browsing failed for every chunk: {'; '.join(failures)}")
         return results
 
     def _find(self, batch: Sequence[str]) -> dict:

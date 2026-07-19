@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -658,3 +659,64 @@ def test_gsb_from_env_raises_clean_error_without_a_key(monkeypatch):
     crit = load_criteria(REPO_ROOT / "criteria.toml")
     with pytest.raises(toxicity.ToxicityKeyMissing):
         toxicity.GsbClient.from_env(_fake_client(lambda r: httpx.Response(200, json={})), crit)
+
+
+def test_gsb_check_multi_chunk_happy_path_calls_once_per_chunk():
+    """Multi-chunk is an expected production case, not an edge case: as soon as a real
+    day's screen exceeds tox_gsb_batch_size // 2 domains, this is the normal path, yet
+    no prior test drove more than one chunk. dataclasses.replace narrows the batch size
+    (Criteria is frozen) so 5 domains force 3 chunks (2, 2, 1) without needing 126+ inputs."""
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    crit = dataclasses.replace(crit, tox_gsb_batch_size=4)   # chunk = 4 // 2 = 2
+    domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]  # chunks: [a,b] [c,d] [e]
+    got = toxicity.GsbClient(_fake_client(handler), crit, "k").check(domains)
+    assert len(calls) == 3
+    assert set(got) == set(domains)
+    assert len(got) == len(domains)          # no duplicates, nothing dropped
+    for d in domains:
+        assert got[d].currently_listed is False
+
+
+def test_gsb_check_partial_chunk_failure_omits_only_that_chunks_domains():
+    """THE false-negative guard. A domain whose chunk failed must be ABSENT from the
+    returned dict - never present-and-not-listed. The obviously-tempting fix (keep the
+    old pre-populate-everything-as-not-listed behaviour and just wrap _find in
+    try/except) would make an unchecked domain read as clean, which is the worst
+    possible failure mode for a hard-reject leg. This test is the guard against that
+    regression: c.com/d.com's chunk 500s, so they must be MISSING from the result,
+    while a.com/b.com (chunk 1) and e.com (chunk 3) - which succeeded - must survive."""
+    def handler(request):
+        body = json.loads(request.content)
+        urls = {e["url"] for e in body["threatInfo"]["threatEntries"]}
+        if any("c.com" in u for u in urls):
+            return httpx.Response(500)
+        return httpx.Response(200, json={})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    crit = dataclasses.replace(crit, tox_gsb_batch_size=4)   # chunk = 2
+    domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]  # chunk 2 = [c.com, d.com] fails
+    got = toxicity.GsbClient(_fake_client(handler), crit, "k").check(domains)
+    assert "a.com" in got and got["a.com"].currently_listed is False
+    assert "b.com" in got and got["b.com"].currently_listed is False
+    assert "e.com" in got and got["e.com"].currently_listed is False
+    assert "c.com" not in got                # false-negative guard: absent, not not-listed
+    assert "d.com" not in got
+
+
+def test_gsb_check_all_chunks_failing_raises_gsberror():
+    """Only when EVERY chunk fails - and we therefore know nothing at all - does
+    check() raise, so the caller (screen()) can mark every pending domain as errored."""
+    def handler(request):
+        return httpx.Response(500)
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    crit = dataclasses.replace(crit, tox_gsb_batch_size=4)
+    domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
+    with pytest.raises(toxicity.GsbError):
+        toxicity.GsbClient(_fake_client(handler), crit, "k").check(domains)
