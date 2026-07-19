@@ -80,3 +80,86 @@ def bucket_monthly(captures: Iterable[Capture]) -> list[Capture]:
         seen.add(month)
         out.append(cap)
     return out
+
+
+def _to_dt(timestamp: str) -> datetime:
+    return datetime.strptime(timestamp[:14].ljust(14, "0"), "%Y%m%d%H%M%S")
+
+
+def _months_before(moment: datetime, months: int) -> datetime:
+    """Calendar-correct month subtraction without pulling in dateutil."""
+    year, month = moment.year, moment.month - months
+    while month <= 0:
+        month += 12
+        year -= 1
+    day = min(moment.day, calendar.monthrange(year, month)[1])
+    return moment.replace(year=year, month=month, day=day)
+
+
+def _status_bucket(code: str) -> str:
+    return f"{code[0]}xx" if code[:1].isdigit() and code[0] in "2345" else "other"
+
+
+def _block(captures: Sequence[Capture]) -> ShapeBlock:
+    first, last = captures[0], captures[-1]
+    span_days = (_to_dt(last.timestamp) - _to_dt(first.timestamp)).days
+    span_years = span_days / 365.25
+    status_mix: dict = {}
+    mime_mix: dict = {}
+    for cap in captures:
+        bucket = _status_bucket(cap.statuscode)
+        status_mix[bucket] = status_mix.get(bucket, 0) + 1
+        mime_mix[cap.mimetype] = mime_mix.get(cap.mimetype, 0) + 1
+    max_gap_days = 0
+    for prev, nxt in zip(captures, captures[1:]):
+        max_gap_days = max(max_gap_days,
+                           (_to_dt(nxt.timestamp) - _to_dt(prev.timestamp)).days)
+    return ShapeBlock(
+        first_capture=first.timestamp,
+        last_capture=last.timestamp,
+        span_years=round(span_years, 3),
+        capture_count=len(captures),
+        distinct_years=len({c.timestamp[:4] for c in captures}),
+        max_gap_years=round(max_gap_days / 365.25, 3),
+        digest_churn=round(len({c.digest for c in captures}) / len(captures), 4),
+        captures_per_year=round(len(captures) / max(span_years, 1 / 365.25), 3),
+        status_mix=status_mix,
+        mime_mix=mime_mix,
+    )
+
+
+def _proportion(mix: dict, total: int, *keys: str) -> float:
+    return sum(mix.get(k, 0) for k in keys) / total if total else 0.0
+
+
+def compute_shape(captures, *, tail_window_months: int,
+                  tail_min_captures: int) -> HistoryShape | None:
+    """None means NO captures - stable, informative absence, which decide() turns into
+    unknown_no_history. It must never become a ShapeBlock of zeros, which would read
+    downstream as 'we measured this domain and it scored badly'."""
+    sampled = bucket_monthly(captures)
+    if not sampled:
+        return None
+    lifetime = _block(sampled)
+
+    cutoff = _months_before(_to_dt(sampled[-1].timestamp), tail_window_months)
+    tail_caps = [c for c in sampled if _to_dt(c.timestamp) >= cutoff]
+
+    # Too thin to support a ratio, or the tail IS the whole life (every ratio would be
+    # 1.0 by construction - a meaningless 'no divergence' that reads as 'checked, fine').
+    if len(tail_caps) < tail_min_captures or len(tail_caps) == len(sampled):
+        return HistoryShape(lifetime=lifetime, tail=None, divergence=None)
+
+    tail = _block(tail_caps)
+    lt_total, t_total = lifetime.capture_count, tail.capture_count
+    divergence = Divergence(
+        churn_ratio=(round(tail.digest_churn / lifetime.digest_churn, 4)
+                     if lifetime.digest_churn else None),
+        status_shift=round(_proportion(tail.status_mix, t_total, "2xx")
+                           - _proportion(lifetime.status_mix, lt_total, "2xx"), 4),
+        mime_shift=round(_proportion(tail.mime_mix, t_total, "text/html")
+                         - _proportion(lifetime.mime_mix, lt_total, "text/html"), 4),
+        captures_per_year_ratio=(round(tail.captures_per_year / lifetime.captures_per_year, 4)
+                                 if lifetime.captures_per_year else None),
+    )
+    return HistoryShape(lifetime=lifetime, tail=tail, divergence=divergence)
