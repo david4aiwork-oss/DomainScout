@@ -123,6 +123,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_comps.add_argument("--data-dir", dest="data_dir", help="cache directory (default: data)")
     p_comps.set_defaults(func=commands.cmd_comps)
 
+    p_screen = sub.add_parser(
+        "screen",
+        help="[Phase 5b] toxicity screen for one or more domains (HITS THE NETWORK)",
+        description=(
+            "Safe Browsing (hard reject on a current listing) + Wayback CDX history "
+            "shape (a graded signal for Tier-2). Needs GOOGLE_SAFE_BROWSING_API_KEY "
+            "in .env. Verdicts cache to data/toxicity_cache.json; transient failures "
+            "are never cached, so they retry on the next run."
+        ),
+    )
+    p_screen.add_argument("--domain", help="a single domain, e.g. cloudvault.com")
+    p_screen.add_argument("--domains", help="comma-separated list (exercises GSB batching)")
+    p_screen.add_argument("--criteria", default="criteria.toml",
+                          help="path to criteria.toml (default: criteria.toml)")
+    p_screen.add_argument("--cache-path", dest="cache_path",
+                          help="verdict cache path (default: data/toxicity_cache.json)")
+    p_screen.add_argument("--no-cache", action="store_true", dest="no_cache",
+                          help="ignore and do not write the verdict cache")
+    p_screen.add_argument("--json", action="store_true",
+                          help="emit the 5c prompt payload instead of the human summary")
+    p_screen.add_argument("--dry-run", action="store_true",
+                          help="report the calls that would be made, make none")
+    p_screen.set_defaults(func=commands.cmd_screen)
+
     for name, help_text in _STUB_HELP.items():
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=commands.cmd_stub)

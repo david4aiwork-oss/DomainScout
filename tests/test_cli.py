@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from domainscout.__main__ import main
+from domainscout import commands
+from domainscout.__main__ import build_parser, main
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -230,3 +231,37 @@ def test_stale_warning_is_cron_log_safe_encoding(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "STALE" in out and "retailstats" in out            # it actually warned
     out.encode("cp1252")                                       # must NOT raise
+
+
+def test_screen_is_a_real_subcommand_not_a_stub():
+    parser = build_parser()
+    args = parser.parse_args(["screen", "--domain", "a.com"])
+    assert args.func is commands.cmd_screen
+
+
+def test_screen_without_api_key_exits_1_cleanly(monkeypatch, capsys, tmp_path):
+    """A missing key must be a readable message and exit 1, never a raw traceback
+    (5a's CompsCacheMissing precedent)."""
+    monkeypatch.delenv("GOOGLE_SAFE_BROWSING_API_KEY", raising=False)
+    monkeypatch.setattr("domainscout.config.load_dotenv", lambda *a, **k: None)
+    args = build_parser().parse_args(
+        ["screen", "--domain", "a.com", "--cache-path", str(tmp_path / "c.json")])
+    assert args.func(args) == 1
+    assert "GOOGLE_SAFE_BROWSING_API_KEY" in capsys.readouterr().err
+
+
+def test_screen_dry_run_makes_no_network_calls(monkeypatch, capsys):
+    def explode(*a, **k):
+        raise AssertionError("dry-run must not build a network client")
+
+    monkeypatch.setattr("domainscout.ingest.make_client", explode)
+    args = build_parser().parse_args(["screen", "--domain", "a.com", "--dry-run"])
+    assert args.func(args) == 0
+    assert "dry-run" in capsys.readouterr().out
+
+
+def test_screen_output_is_ascii_only(monkeypatch, capsys):
+    """5a shipped one emoji that crashed the cron path on redirected cp1252 stdout."""
+    args = build_parser().parse_args(["screen", "--domain", "a.com", "--dry-run"])
+    args.func(args)
+    capsys.readouterr().out.encode("cp1252")   # must not raise

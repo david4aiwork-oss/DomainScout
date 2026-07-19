@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from domainscout import comps, db, filters, ingest, pronounce, rdap
+from domainscout import comps, config, db, filters, ingest, pronounce, rdap, toxicity
 from domainscout.config import load_criteria
 
 # Subcommand -> the phase number that will implement it.
@@ -199,4 +199,59 @@ def cmd_comps(args: argparse.Namespace) -> int:
         print(f"  .com retail baseline: n={base.get('sale_count', 0):,} "
               f"avg=${base.get('price_avg', 0):,.0f}")
     print(comps.context_to_json(ctx))
+    return 0
+
+
+def cmd_screen(args: argparse.Namespace) -> int:
+    """Phase 5b debug CLI. UNLIKE `comps`, this DOES hit the network."""
+    criteria = load_criteria(args.criteria)
+    domains = [d.strip() for d in (args.domains.split(",") if args.domains else [args.domain])
+               if d.strip()]
+    if args.dry_run:
+        print(f"screen: [dry-run] would query CDX for {len(domains)} domain(s) and send "
+              f"{len(domains) * 2} URL(s) to safe-browsing in 1 batch (nothing written)")
+        return 0
+
+    config.load_dotenv()
+    client = ingest.make_client(timeout=criteria.tox_cdx_timeout)
+    try:
+        try:
+            gsb = toxicity.GsbClient.from_env(client, criteria)
+        except toxicity.ToxicityKeyMissing as exc:
+            print(f"screen: {exc}", file=sys.stderr)
+            return 1
+        cache = None
+        if not args.no_cache:
+            cache = toxicity.VerdictCache(
+                args.cache_path or toxicity.DEFAULT_CACHE_PATH,
+                cache_days=criteria.tox_cache_days, collapse=criteria.tox_cdx_collapse)
+        verdicts = toxicity.screen(domains, cdx=toxicity.CdxClient(client, criteria),
+                                   gsb=gsb, criteria=criteria, cache=cache)
+    finally:
+        client.close()
+
+    for verdict in verdicts:
+        if args.json:
+            print(toxicity.verdict_to_json(verdict))
+            continue
+        print(f"{verdict.domain}  verdict={verdict.verdict}")
+        print(f"  reason: {verdict.reason}")
+        if verdict.gsb:
+            print(f"  safe-browsing currently_listed={verdict.gsb.currently_listed} "
+                  f"threats={list(verdict.gsb.threat_types)}"
+                  "   (a snapshot of current listings, NOT a guarantee of safety)")
+        if verdict.history:
+            lt = verdict.history.lifetime
+            print(f"  lifetime: {lt.first_capture[:8]}..{lt.last_capture[:8]} "
+                  f"span={lt.span_years:.1f}y n={lt.capture_count} churn={lt.digest_churn:.2f}")
+            if verdict.history.divergence:
+                dv = verdict.history.divergence
+                print(f"  tail divergence: churn_ratio={dv.churn_ratio} "
+                      f"status_shift={dv.status_shift:+.2f} mime_shift={dv.mime_shift:+.2f}")
+            else:
+                print("  tail divergence: n/a (too few tail captures, or tail covers "
+                      "the whole life)")
+        elif verdict.verdict == toxicity.VERDICT_UNKNOWN_NO_HISTORY:
+            print("  no wayback captures - absence of evidence. Invented brandables are "
+                  "routinely unarchived; this is NOT a negative signal.")
     return 0
