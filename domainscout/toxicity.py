@@ -163,3 +163,26 @@ def compute_shape(captures, *, tail_window_months: int,
                                  if lifetime.captures_per_year else None),
     )
     return HistoryShape(lifetime=lifetime, tail=tail, divergence=divergence)
+
+
+def decide(gsb: GsbResult | None, shape: HistoryShape | None,
+           errors: Sequence[str]) -> tuple[str, str]:
+    """Precedence, in order:
+
+        gsb listed            -> reject               terminal; outranks everything,
+                                                      including a failed CDX leg
+        gsb or cdx errored    -> unknown_error        transient; retried next run
+        cdx ok, 0 captures    -> unknown_no_history   stable absence
+        otherwise             -> pass
+
+    Every non-reject verdict PROCEEDS to Tier-2 carrying its reason. Failing closed on
+    unknown would let one bad archive.org day silently empty the digest - a failure mode
+    far harder to notice than a false positive."""
+    if gsb is not None and gsb.currently_listed:
+        return VERDICT_REJECT, "safe-browsing listed: " + ",".join(gsb.threat_types)
+    if errors:
+        return VERDICT_UNKNOWN_ERROR, "; ".join(errors)
+    if shape is None:
+        return (VERDICT_UNKNOWN_NO_HISTORY,
+                "no wayback captures - absence of evidence, not evidence of anything")
+    return VERDICT_PASS, "not currently listed; history shape recorded"

@@ -232,3 +232,38 @@ def test_mime_shift_and_captures_per_year_ratio_in_divergence():
     # captures_per_year: lifetime ≈ 0.696, tail ≈ 2.003
     # ratio ≈ 2.003 / 0.696 ≈ 2.8779, rounded to 4 decimals
     assert div.captures_per_year_ratio == 2.8779
+
+
+_LISTED = models.GsbResult(True, ("MALWARE",), "2026-07-18")
+_NOT_LISTED = models.GsbResult(False, (), "2026-07-18")
+_SHAPE = models.HistoryShape(
+    lifetime=models.ShapeBlock("20100101000000", "20200101000000", 10.0, 20, 10,
+                               1.0, 0.5, 2.0, {"2xx": 20}, {"text/html": 20}),
+    tail=None, divergence=None)
+
+
+def test_decide_gsb_listing_rejects_and_outranks_errors():
+    """A blocklist hit is a fact, not a judgement. It wins even when the other leg
+    failed - we already know enough to reject."""
+    verdict, reason = toxicity.decide(_LISTED, None, ["cdx: timeout"])
+    assert verdict == models.VERDICT_REJECT
+    assert "MALWARE" in reason
+
+
+def test_decide_error_never_becomes_pass():
+    """Invariant 2. A timeout must never be indistinguishable from 'we checked, it's fine'."""
+    verdict, _ = toxicity.decide(_NOT_LISTED, _SHAPE, ["cdx: timeout"])
+    assert verdict == models.VERDICT_UNKNOWN_ERROR
+
+
+def test_decide_no_captures_is_unknown_no_history_not_pass_and_not_reject():
+    """Invariant 1. Invented secondary-track brandables routinely have zero captures;
+    folding that into either pass or reject mis-scores exactly the names we hunt for."""
+    verdict, reason = toxicity.decide(_NOT_LISTED, None, [])
+    assert verdict == models.VERDICT_UNKNOWN_NO_HISTORY
+    assert "absence" in reason.lower()
+
+
+def test_decide_clean_and_archived_is_pass():
+    verdict, _ = toxicity.decide(_NOT_LISTED, _SHAPE, [])
+    assert verdict == models.VERDICT_PASS
