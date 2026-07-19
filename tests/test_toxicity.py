@@ -5,8 +5,10 @@ from pathlib import Path
 import pytest
 
 from domainscout import models, toxicity
+from domainscout.config import load_criteria
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _fixture(name):
@@ -450,3 +452,94 @@ def test_cache_reason_survives_roundtrip(tmp_path):
     retrieved = reopened.get("a.com")
     assert retrieved is not None
     assert retrieved.reason == distinctive_reason
+
+
+import httpx
+
+
+def _fake_client(handler):
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_cdx_client_queries_both_hosts_over_https_with_server_collapse():
+    """Two exact queries per domain. The www. one exists because a domain whose apex
+    only 301s to www. would otherwise be shaped from redirect history, and nothing
+    would look wrong."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.url)
+        return httpx.Response(200, json=[["timestamp", "statuscode", "mimetype", "digest"],
+                                         ["20200115120000", "200", "text/html", "A"]])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    caps = toxicity.CdxClient(_fake_client(handler), crit).fetch("example.com")
+    assert len(seen) == 2
+    assert all(str(u).startswith("https://") for u in seen)
+    assert {u.params["url"] for u in seen} == {"example.com", "www.example.com"}
+    assert all(u.params["matchType"] == "exact" for u in seen)
+    assert all(u.params["collapse"] == crit.tox_cdx_collapse for u in seen)
+    assert [c.digest for c in caps] == ["A"]      # identical rows de-duped across hosts
+
+
+def test_cdx_client_normalizes_a_www_prefixed_input():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params["url"])
+        return httpx.Response(200, json=[])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    toxicity.CdxClient(_fake_client(handler), crit).fetch("www.example.com")
+    assert set(seen) == {"example.com", "www.example.com"}   # not www.www.example.com
+
+
+def test_cdx_client_one_host_failing_does_not_fail_the_domain():
+    """Partial results survive partial failure, same rule as the two legs of screen()."""
+    def handler(request):
+        if request.url.params["url"].startswith("www."):
+            return httpx.Response(503)
+        return httpx.Response(200, json=[["timestamp", "statuscode", "mimetype", "digest"],
+                                         ["20200115120000", "200", "text/html", "A"]])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    caps = toxicity.CdxClient(_fake_client(handler), crit,
+                              sleep=lambda s: None).fetch("example.com")
+    assert [c.digest for c in caps] == ["A"]
+
+
+def test_cdx_client_raises_cdx_error_on_timeout():
+    """Must raise, not return []. An empty list means 'never archived' - a completely
+    different verdict from 'we could not reach the archive'."""
+    def handler(request):
+        raise httpx.ConnectTimeout("boom")
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    with pytest.raises(toxicity.CdxError):
+        toxicity.CdxClient(_fake_client(handler), crit, sleep=lambda s: None).fetch("example.com")
+
+
+def test_cdx_client_never_archived_both_hosts_is_empty_not_an_error():
+    """MEASURED: archive.org returns the literal bytes `[]` for a never-archived name.
+    Empty from both hosts is stable absence -> unknown_no_history, NOT unknown_error."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = toxicity.CdxClient(_fake_client(lambda r: httpx.Response(200, json=[])), crit)
+    assert client.fetch("qzxkvbnmplkjhgfd.com") == []
+
+
+def test_cdx_client_raises_on_5xx_after_retries():
+    calls = {"n": 0}
+    slept = []
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(503)
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=slept.append)
+    with pytest.raises(toxicity.CdxError):
+        client.fetch("example.com")
+    # BOTH hosts are attempted, each exhausting its own retry budget, before the
+    # domain is declared a failure.
+    assert calls["n"] == crit.tox_cdx_max_retries * 2
+    assert slept and all(s > 0 for s in slept)          # real backoff, just not real waiting

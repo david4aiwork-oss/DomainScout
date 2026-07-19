@@ -14,9 +14,12 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
+
+import httpx
 
 from domainscout.models import (
     Capture, Divergence, GsbResult, HistoryShape, ShapeBlock, ToxicityVerdict,
@@ -255,3 +258,85 @@ class VerdictCache:
             os.replace(tmp, self.path)
         except OSError as exc:
             print(f"toxicity: WARNING - could not write cache {self.path}: {exc}")
+
+
+class CdxClient:
+    """Wayback CDX. TWO GETs per domain - the apex and the www. host - each
+    matchType=exact with SERVER-side collapse, then merged. No batching exists.
+
+    QUERY STRATEGY (measured in the Task-1 spike, see docs/PHASE-5B-SPIKE.md; do not
+    change without re-measuring). Three alternatives were tested and all three FAILED:
+
+      * matchType=domain, uncollapsed: unmanageable. The single-URL apex alone is
+        72.2 MB / 1,042,676 rows; the domain-wide unbounded query did not finish in
+        257 s+, and a read-timeout never fires because the server trickles bytes.
+      * from=<date> bounding: truncates 6 days into a 2.5-year window. Rows stay
+        urlkey-then-timestamp sorted regardless of the filter, so time-bounding does
+        not defeat row-truncation.
+      * negative limit: reaches recent timestamps but returns 100% ONE static asset
+        (the alphabetically-last urlkey) - zero page-history signal.
+
+    matchType=exact + server collapse works because a single urlkey makes adjacent-row
+    collapse identical to monthly collapse, and because collapsing shrinks 1M+ rows to
+    ~311 - far below any cap, so truncation never engages at all.
+
+    Both hosts are queried because a domain whose apex merely 301s to www. would
+    otherwise yield a shape computed from redirect history, and NOTHING would look
+    wrong - a 301-only history reads as a thin but valid shape."""
+
+    def __init__(self, client: httpx.Client, criteria, sleep=time.sleep):
+        self.client = client
+        self.criteria = criteria
+        self.sleep = sleep   # injected so retry tests do not actually wait out the backoff
+
+    def _params(self, host: str) -> dict:
+        return {
+            "url": host,
+            "output": "json",
+            "matchType": self.criteria.tox_cdx_match_type,   # 'exact' - one urlkey
+            "collapse": self.criteria.tox_cdx_collapse,      # server-side; legit on one urlkey
+            "fl": "timestamp,statuscode,mimetype,digest",
+            "limit": self.criteria.tox_cdx_limit,            # runaway guard; never engages
+        }
+
+    def _get(self, params: dict) -> list:
+        last: Exception | None = None
+        for attempt in range(self.criteria.tox_cdx_max_retries):
+            try:
+                resp = self.client.get(self.criteria.tox_cdx_base_url, params=params,
+                                       timeout=self.criteria.tox_cdx_timeout)
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    last = CdxError(f"CDX HTTP {resp.status_code}")
+                else:
+                    resp.raise_for_status()
+                    return resp.json() or []
+            except (httpx.TransportError, ValueError) as exc:
+                last = exc
+            self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
+        raise CdxError(f"CDX failed after {self.criteria.tox_cdx_max_retries} attempts: {last}")
+
+    def hosts(self, domain: str) -> tuple[str, str]:
+        bare = domain[4:] if domain.startswith("www.") else domain
+        return (bare, f"www.{bare}")
+
+    def fetch(self, domain: str) -> list[Capture]:
+        """Returns [] for a never-archived domain and RAISES CdxError on failure.
+        These must stay distinguishable - one is stable absence, the other transient
+        ignorance, and they become different verdicts.
+
+        One host failing does NOT fail the domain: if either query succeeds its captures
+        are used, mirroring the partial-results rule. Only a failure of BOTH is CdxError,
+        because only then do we genuinely know nothing."""
+        captures: list[Capture] = []
+        failures: list[str] = []
+        for host in self.hosts(domain):
+            try:
+                captures.extend(parse_cdx(self._get(self._params(host))))
+            except CdxError as exc:
+                failures.append(f"{host}: {exc}")
+        if failures and not captures:
+            raise CdxError(f"CDX failed for every host of {domain} - " + "; ".join(failures))
+        # De-dupe: the two hosts often overlap (and for some domains CDX appears to
+        # canonicalize them to the same record entirely). bucket_monthly re-sorts, so
+        # merge order does not matter.
+        return list({(c.timestamp, c.digest): c for c in captures}.values())
