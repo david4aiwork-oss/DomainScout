@@ -267,3 +267,30 @@ def test_decide_no_captures_is_unknown_no_history_not_pass_and_not_reject():
 def test_decide_clean_and_archived_is_pass():
     verdict, _ = toxicity.decide(_NOT_LISTED, _SHAPE, [])
     assert verdict == models.VERDICT_PASS
+
+
+def test_decide_rung_2_beats_rung_3_errors_outrank_no_history():
+    """Rung 2 must precede rung 3: transient errors (never cached) must not be recorded
+    as stable absence (cached for 30 days). Swapping these rungs is a realistic refactoring
+    accident with severe consequences."""
+    verdict, reason = toxicity.decide(_NOT_LISTED, None, ["cdx: timeout"])
+    assert verdict == models.VERDICT_UNKNOWN_ERROR
+    assert "cdx: timeout" in reason
+
+
+def test_decide_unknown_error_reason_carries_all_diagnostics():
+    """Multiple errors must all appear in the reason, so downstream can pinpoint which
+    leg failed. Returning only the first error would silently swallow diagnostic info."""
+    verdict, reason = toxicity.decide(_NOT_LISTED, _SHAPE, ["cdx: timeout", "safe-browsing: HTTP 500"])
+    assert verdict == models.VERDICT_UNKNOWN_ERROR
+    assert "cdx: timeout" in reason
+    assert "safe-browsing: HTTP 500" in reason
+    assert reason == "cdx: timeout; safe-browsing: HTTP 500"
+
+
+def test_decide_gsb_none_guards_against_null_dereference():
+    """The signature permits gsb=None (Safe Browsing leg failed entirely). The 'gsb is not
+    None and ...' guard must be present to prevent AttributeError on a real GSB outage."""
+    verdict, reason = toxicity.decide(None, _SHAPE, ["safe-browsing: boom"])
+    assert verdict == models.VERDICT_UNKNOWN_ERROR
+    assert "safe-browsing: boom" in reason
