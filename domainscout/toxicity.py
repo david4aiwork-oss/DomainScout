@@ -204,7 +204,10 @@ class VerdictCache:
       2. Every entry records the collapse it was computed under, and an entry whose
          collapse differs from the current config is a MISS. That makes 'thresholds
          are calibrated to this sampling' self-enforcing instead of a comment someone
-         has to notice."""
+         has to notice.
+
+    A third rule, added after a review finding: save() is a no-op unless put() has
+    actually stored something since load. See the _dirty flag below."""
 
     def __init__(self, path, *, cache_days: dict, collapse: str, now: datetime | None = None):
         self.path = Path(path)
@@ -212,6 +215,7 @@ class VerdictCache:
         self.collapse = collapse
         self.now = now or datetime.now()
         self._entries: dict = {}
+        self._dirty = False   # set by put(); save() no-ops while this is False
         if self.path.is_file():
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
@@ -242,21 +246,31 @@ class VerdictCache:
 
     def put(self, verdict: ToxicityVerdict) -> None:
         if verdict.verdict == VERDICT_UNKNOWN_ERROR:
-            return   # see rule 1
+            return   # see rule 1 - and note: must NOT mark the cache dirty either
         self._entries[verdict.domain] = {
             "verdict": verdict.verdict, "reason": verdict.reason,
             "screened_at": verdict.screened_at, "collapse": verdict.collapse,
         }
+        self._dirty = True
 
     def save(self) -> None:
         """Temp-file + os.replace. The OSError catch is not theoretical: 5a hit a real
-        Windows AV file-lock during exactly this rename."""
+        Windows AV file-lock during exactly this rename.
+
+        No-ops (no mkdir, no temp-write, no rename) unless put() has stored something
+        since load/construction - a review finding after a run where every requested
+        domain was a live cache hit still re-exercised that same rename for zero
+        benefit, needlessly re-exposing the exact failure surface above. This makes the
+        guarantee hold for every caller, not just screen()."""
+        if not self._dirty:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         try:
             tmp.write_text(json.dumps(self._entries, indent=1, sort_keys=True),
                            encoding="utf-8")
             os.replace(tmp, self.path)
+            self._dirty = False
         except OSError as exc:
             print(f"toxicity: WARNING - could not write cache {self.path}: {exc}")
 

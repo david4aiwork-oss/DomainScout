@@ -335,12 +335,18 @@ def test_cache_never_persists_unknown_error(tmp_path):
     """NOT a TTL of 0 - never written at all. A transient failure then CANNOT be
     misconfigured into stickiness, which any numeric TTL eventually can."""
     now = datetime(2026, 7, 18)
-    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+    cache_file = tmp_path / "c.json"
+    cache = toxicity.VerdictCache(cache_file, cache_days=_DAYS,
                                   collapse="timestamp:6", now=now)
     cache.put(_verdict("a.com", models.VERDICT_UNKNOWN_ERROR, screened_at=now.isoformat()))
     cache.save()
     assert cache.get("a.com") is None
-    assert "a.com" not in json.loads((tmp_path / "c.json").read_text(encoding="utf-8"))
+    # Post-review-fix: put()'s unknown_error early return never marks the cache dirty
+    # (see test_cache_put_of_only_unknown_error_leaves_cache_clean), so save() now
+    # no-ops entirely here and the file need not even exist. Either way "a.com" must
+    # never appear in it.
+    if cache_file.is_file():
+        assert "a.com" not in json.loads(cache_file.read_text(encoding="utf-8"))
 
 
 def test_cache_misses_when_collapse_changed(tmp_path):
@@ -835,3 +841,122 @@ def test_screen_gsb_partial_chunk_failure_marks_only_that_domain_unknown_error()
     assert by_domain["a.com"].gsb is None
     assert by_domain["b.com"].gsb is not None
     assert by_domain["b.com"].gsb.currently_listed is False
+
+
+class _ReplaceCalledError(Exception):
+    """Sentinel raised by a monkeypatched os.replace so a test can prove whether the
+    rename was ATTEMPTED at all - stronger than checking file bytes/mtime afterwards,
+    and distinguishable from the OSError that save() itself catches and warns about."""
+
+
+def test_screen_all_cache_hits_never_touches_os_replace(tmp_path, monkeypatch):
+    """Review finding: screen() used to end with an unconditional `if cache:
+    cache.save()`. When every requested domain is a live cache hit, nothing was ever
+    put() since load, so save() must not perform its mkdir + temp-write + os.replace
+    dance on an unchanged file - VerdictCache.save's own docstring records that a real
+    Windows AV file-lock hit exactly that rename in a prior phase, so a pure-read call
+    must not needlessly re-exercise that failure surface. Monkeypatching os.replace to
+    raise is the strong form of this assertion: it proves the rename is never even
+    attempted, not merely that the file's bytes end up unchanged."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    now = datetime(2026, 7, 18)
+    cache_path = tmp_path / "c.json"
+
+    seed = toxicity.VerdictCache(cache_path, cache_days=_DAYS,
+                                 collapse=crit.tox_cdx_collapse, now=now)
+    seed.put(models.ToxicityVerdict("a.com", models.VERDICT_PASS, "cached", None, None,
+                                    now.isoformat(), crit.tox_cdx_collapse))
+    seed.save()   # persist the seed entry normally, BEFORE the trap below is armed
+
+    def _trap(src, dst):
+        raise _ReplaceCalledError("os.replace must not be attempted on an all-cache-hit screen")
+    monkeypatch.setattr("os.replace", _trap)
+
+    reopened = toxicity.VerdictCache(cache_path, cache_days=_DAYS,
+                                     collapse=crit.tox_cdx_collapse, now=now)
+    out = toxicity.screen(["a.com"], cdx=_FakeCdx({}), gsb=_FakeGsb(), criteria=crit,
+                          cache=reopened, now=now)
+    assert out[0].verdict == models.VERDICT_PASS   # sanity: it really was a cache hit
+
+
+def test_screen_new_verdict_triggers_a_cache_write(tmp_path, monkeypatch):
+    """Counterpart to the test above: without this, a fix that made save() ALWAYS
+    no-op (never writing anything, ever again) would also make the all-cache-hit test
+    pass, for the wrong reason. A domain with no cache hit produces a newly-computed,
+    cacheable verdict, put() marks the cache dirty, and save() must still attempt the
+    rename - proven the same way, by observing the trap fire."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse=crit.tox_cdx_collapse, now=now)
+
+    def _trap(src, dst):
+        raise _ReplaceCalledError("proof os.replace was attempted for a new verdict")
+    monkeypatch.setattr("os.replace", _trap)
+
+    with pytest.raises(_ReplaceCalledError):
+        toxicity.screen(["new.com"], cdx=_FakeCdx({}), gsb=_FakeGsb(), criteria=crit,
+                        cache=cache, now=now)
+
+
+def test_cache_put_of_only_unknown_error_leaves_cache_clean(tmp_path, monkeypatch):
+    """Pins that put()'s early return for unknown_error does NOT mark the cache dirty.
+    If it did, a screen that produced nothing but transient errors would still trip
+    the rename for a cache that gained zero persistable state - the exact needless
+    rewrite this fix exists to prevent, just reached via a different path than the
+    all-cache-hit case above."""
+    now = datetime(2026, 7, 18)
+    cache_path = tmp_path / "c.json"
+    cache = toxicity.VerdictCache(cache_path, cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    cache.put(_verdict("a.com", models.VERDICT_UNKNOWN_ERROR, screened_at=now.isoformat()))
+
+    def _trap(src, dst):
+        raise _ReplaceCalledError("os.replace must not be attempted - nothing was stored")
+    monkeypatch.setattr("os.replace", _trap)
+
+    cache.save()   # must be a no-op; _trap would raise if os.replace were invoked
+    assert not cache_path.is_file()
+
+
+def test_verdict_json_full_history_shape_round_trips_with_populated_tail_and_divergence():
+    """The ONLY other test exercising verdict_to_json's history branch
+    (test_verdict_json_names_the_gsb_field_currently_listed) feeds a CDX fake with
+    zero captures, so history is always None there. That leaves the exact JSON shape
+    5c will inject into its Tier-2 prompt - a HistoryShape with a POPULATED tail and
+    divergence - completely unverified. This reuses the stable-then-flip capture
+    series from test_compute_shape_detects_tail_flip_that_lifetime_aggregates_hide
+    (distinct calendar months throughout, >= tail_min_captures in the trailing
+    24-month window, and the tail does not cover the whole life) and asserts on the
+    parsed JSON, not just on the dataclasses."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    stable = [(f"{y}{m:02d}15120000", "SAME") for y in range(2010, 2020) for m in (1, 7)]
+    churny = [(f"2020{m:02d}15120000", f"FLIP{m}") for m in range(1, 13)]
+    caps = _caps(stable + churny)
+
+    v = toxicity.screen(["flippy.com"], cdx=_FakeCdx({"flippy.com": caps}),
+                        gsb=_FakeGsb(), criteria=crit)[0]
+    assert v.history is not None
+    assert v.history.tail is not None and v.history.divergence is not None  # sanity pre-JSON
+
+    raw = toxicity.verdict_to_json(v)
+    payload = json.loads(raw)   # must not raise - JSON-serializability of the whole payload
+
+    lifetime = payload["history"]["lifetime"]
+    assert set(lifetime) == {
+        "first_capture", "last_capture", "span_years", "capture_count", "distinct_years",
+        "max_gap_years", "digest_churn", "captures_per_year", "status_mix", "mime_mix",
+    }
+
+    tail = payload["history"]["tail"]
+    assert tail is not None and tail["capture_count"] > 0
+
+    divergence = payload["history"]["divergence"]
+    assert divergence is not None
+    assert set(divergence) >= {"churn_ratio", "status_shift", "mime_shift",
+                               "captures_per_year_ratio"}
+
+    json.loads(json.dumps(payload))   # round-trip a second time, belt and braces
+
+    blob = raw.lower()
+    assert "clean" not in blob and '"safe"' not in blob
