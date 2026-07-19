@@ -151,3 +151,88 @@ class RefreshResult:
     @property
     def any_refused(self) -> bool:
         return any(f.action == "refused" for f in self.files)
+
+
+# --- Phase 5b: toxicity gate -------------------------------------------------
+# Four verdicts, NOT three. unknown_no_history (CDX succeeded, zero captures) is
+# STABLE, informative absence - re-screening will not change it, and for an invented
+# secondary-track brandable it is mildly reassuring. unknown_error is TRANSIENT
+# ignorance and must be retried. Collapsing them would leave 5c unable to tell a
+# young name from a failed lookup.
+VERDICT_REJECT = "reject"
+VERDICT_UNKNOWN_ERROR = "unknown_error"
+VERDICT_UNKNOWN_NO_HISTORY = "unknown_no_history"
+VERDICT_PASS = "pass"
+
+
+@dataclass(frozen=True)
+class Capture:
+    """One Wayback CDX row. timestamp is 'YYYYMMDDhhmmss'."""
+
+    timestamp: str
+    statuscode: str
+    mimetype: str
+    digest: str
+
+
+@dataclass(frozen=True)
+class ShapeBlock:
+    """History metrics over one time range. Computed over the MONTHLY-SAMPLED series,
+    never the raw archive - raw counts are dominated by crawl-frequency artifacts."""
+
+    first_capture: str | None
+    last_capture: str | None
+    span_years: float
+    capture_count: int
+    distinct_years: int
+    max_gap_years: float
+    digest_churn: float          # distinct digests / captures
+    captures_per_year: float
+    status_mix: dict             # '2xx'/'3xx'/'4xx'/'5xx'/'other' -> count
+    mime_mix: dict               # mimetype -> count
+
+
+@dataclass(frozen=True)
+class Divergence:
+    """Tail-vs-lifetime deltas. This is the content-flip signal: lifetime aggregates
+    CANNOT show a late-life flip (12 clean years + 18 months of gambling averages out
+    to respectable numbers), so the divergence is where the flip actually lives.
+    5b reports these; it does NOT threshold them - interpretation is Tier-2's job."""
+
+    churn_ratio: float | None            # tail.digest_churn / lifetime.digest_churn
+    status_shift: float                  # tail 2xx proportion - lifetime 2xx proportion
+    mime_shift: float                    # tail text/html proportion - lifetime's
+    captures_per_year_ratio: float | None
+
+
+@dataclass(frozen=True)
+class HistoryShape:
+    lifetime: ShapeBlock
+    tail: ShapeBlock | None              # None if too few tail captures to be meaningful
+    divergence: Divergence | None        # None whenever tail is None
+
+
+@dataclass(frozen=True)
+class GsbResult:
+    """Safe Browsing is a blocklist of CURRENTLY listed URLs. A False here means
+    'not presently listed' - a dropped domain that served malware in 2019 may well
+    have aged off. The field is named currently_listed, never 'clean' or 'safe',
+    so no downstream prompt can present it as verified-safe."""
+
+    currently_listed: bool
+    threat_types: tuple[str, ...]
+    checked_at: str
+
+
+@dataclass(frozen=True)
+class ToxicityVerdict:
+    """The verdict reflects the WORST leg; the data reflects EVERY leg that succeeded.
+    A GSB success rides along even when CDX failed, and vice versa."""
+
+    domain: str
+    verdict: str
+    reason: str
+    gsb: GsbResult | None
+    history: HistoryShape | None
+    screened_at: str
+    collapse: str                        # the sampling this verdict was computed under
