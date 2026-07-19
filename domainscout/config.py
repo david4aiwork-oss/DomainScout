@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -55,6 +56,24 @@ class Criteria:
     comps_min_rows_retailstats: int = 1000
     comps_min_rows_tldstats: int = 100
     comps_stale_warn_factor: int = 3
+    tox_cdx_base_url: str = "https://web.archive.org/cdx/search/cdx"
+    tox_cdx_collapse: str = "timestamp:6"
+    tox_cdx_match_type: str = "exact"
+    tox_cdx_limit: int = 5000
+    tox_cdx_timeout: float = 20.0
+    tox_cdx_max_rps: float = 1.0
+    tox_cdx_max_retries: int = 3
+    tox_tail_window_months: int = 24
+    tox_tail_min_captures: int = 3
+    tox_gsb_base_url: str = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
+    tox_gsb_batch_size: int = 250
+    tox_gsb_timeout: float = 15.0
+    tox_gsb_threat_types: tuple[str, ...] = (
+        "MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION")
+    tox_gsb_platform_types: tuple[str, ...] = ("ANY_PLATFORM",)
+    tox_gsb_threat_entry_types: tuple[str, ...] = ("URL",)
+    tox_cache_days: dict = field(
+        default_factory=lambda: {"reject": 30, "pass": 14, "unknown_no_history": 30})
 
     @property
     def ingest_max_length(self) -> int:
@@ -171,6 +190,25 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
     comps_stale_warn_factor = _as_int(
         comps_tbl.get("stale_warn_factor", 3), "[comps].stale_warn_factor")
 
+    tox_tbl = data.get("toxicity", {})
+    if not isinstance(tox_tbl, dict):
+        raise ConfigError("criteria.toml: [toxicity] must be a table")
+    tox_cdx_base_url = str(tox_tbl.get("cdx_base_url", "https://web.archive.org/cdx/search/cdx"))
+    if not tox_cdx_base_url.startswith("https://"):
+        raise ConfigError(
+            "criteria.toml: [toxicity].cdx_base_url must be https:// - this box MITMs TLS and "
+            "the plaintext path is neither encrypted nor the code path we harden and test")
+    _DEFAULT_CACHE_DAYS = {"reject": 30, "pass": 14, "unknown_no_history": 30}
+    cache_tbl = tox_tbl.get("cache_days", {})
+    if not isinstance(cache_tbl, dict):
+        raise ConfigError("criteria.toml: [toxicity.cache_days] must be a table")
+    if "unknown_error" in cache_tbl:
+        raise ConfigError(
+            "criteria.toml: [toxicity.cache_days].unknown_error must NOT be set - transient "
+            "failures are never cached, so they are always retried on the next run")
+    tox_cache_days = {**_DEFAULT_CACHE_DAYS,
+                      **{str(k): _as_int(v, f"[toxicity.cache_days].{k}") for k, v in cache_tbl.items()}}
+
     return Criteria(
         tld=tld,
         charset=charset,
@@ -203,4 +241,42 @@ def load_criteria(path: str | Path = "criteria.toml") -> Criteria:
         comps_min_rows_retailstats=comps_min_rows_retailstats,
         comps_min_rows_tldstats=comps_min_rows_tldstats,
         comps_stale_warn_factor=comps_stale_warn_factor,
+        tox_cdx_base_url=tox_cdx_base_url,
+        tox_cdx_collapse=str(tox_tbl.get("cdx_collapse", "timestamp:6")),
+        tox_cdx_match_type=str(tox_tbl.get("cdx_match_type", "exact")),
+        tox_cdx_limit=_as_int(tox_tbl.get("cdx_limit", 5000), "[toxicity].cdx_limit"),
+        tox_cdx_timeout=_as_float(tox_tbl.get("cdx_timeout", 20.0), "[toxicity].cdx_timeout"),
+        tox_cdx_max_rps=_as_float(tox_tbl.get("cdx_max_requests_per_sec", 1.0), "[toxicity].cdx_max_requests_per_sec"),
+        tox_cdx_max_retries=_as_int(tox_tbl.get("cdx_max_retries", 3), "[toxicity].cdx_max_retries"),
+        tox_tail_window_months=_as_int(tox_tbl.get("tail_window_months", 24), "[toxicity].tail_window_months"),
+        tox_tail_min_captures=_as_int(tox_tbl.get("tail_min_captures", 3), "[toxicity].tail_min_captures"),
+        tox_gsb_base_url=str(tox_tbl.get("gsb_base_url", "https://safebrowsing.googleapis.com/v4/threatMatches:find")),
+        tox_gsb_batch_size=_as_int(tox_tbl.get("gsb_batch_size", 250), "[toxicity].gsb_batch_size"),
+        tox_gsb_timeout=_as_float(tox_tbl.get("gsb_timeout", 15.0), "[toxicity].gsb_timeout"),
+        tox_gsb_threat_types=tuple(tox_tbl.get("gsb_threat_types", ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"])),
+        tox_gsb_platform_types=tuple(tox_tbl.get("gsb_platform_types", ["ANY_PLATFORM"])),
+        tox_gsb_threat_entry_types=tuple(tox_tbl.get("gsb_threat_entry_types", ["URL"])),
+        tox_cache_days=tox_cache_days,
     )
+
+
+def load_dotenv(path: str | Path = ".env") -> None:
+    """Populate os.environ from a flat KEY=VALUE file. A REAL environment variable
+    always wins over the file, so Task Scheduler and CI can override it. A missing
+    file is not an error - most commands need no secret at all.
+
+    Deliberately not python-dotenv: our format has no interpolation, no multiline
+    values, and no export syntax, so the library's edge-case handling buys nothing
+    against a 5th runtime dependency."""
+    p = Path(path)
+    if not p.is_file():
+        return
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)   # setdefault == real env wins

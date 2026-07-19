@@ -83,6 +83,53 @@ stale_warn_factor = 3               # warn loudly once a cache is older than thi
 #   WARNING: `comps-refresh --force` can burn the download window and lock you out for HOURS.
 #            `comps --domain` is local-only (reads the cache) and never touches the network.
 
+[toxicity]
+cdx_base_url = "https://web.archive.org/cdx/search/cdx"
+                                 # HTTPS, not HTTP: this box MITMs TLS and the whole codebase is
+                                 # hardened for the proxied-TLS path via truststore. One plaintext
+                                 # call would be both unencrypted AND on a differently-behaving
+                                 # code path from everything we've tested.
+cdx_collapse = "timestamp:6"     # One capture/month. ALL shape thresholds and any Tier-2 prompt
+                                 # calibration are relative to this sampling. capture_count and
+                                 # digest_churn are properties of the SAMPLED series, not the raw
+                                 # archive (arguably better: raw counts are dominated by
+                                 # crawl-frequency artifacts). Changing it invalidates every cached
+                                 # verdict - by design, since entries record their collapse and
+                                 # miss on mismatch.
+                                 # Applied SERVER-side (legitimate: one urlkey per query, so
+                                 # adjacent-row collapse IS monthly collapse), then again
+                                 # client-side over the merged two-host set.
+cdx_match_type = "exact"         # MEASURED 2026-07-18 (spike, see PHASE-5B-SPIKE.md). NOT "domain":
+                                 # matchType=domain spreads the row budget across thousands of
+                                 # urlkeys (cnn.com: 2,768), so collapse samples per-URL-block and
+                                 # digest_churn reads URL DIVERSITY as content volatility. Two exact
+                                 # queries (apex + www.) are issued and merged instead - see
+                                 # CdxClient. Deep-subpath history is deliberately given up; it was
+                                 # the contamination, and shape is the story of the front door.
+cdx_limit = 5000                 # Never engages under the ratified strategy - the worst-case domain
+                                 # measured collapses to 311 rows. Kept as a runaway guard only.
+cdx_timeout = 20.0
+cdx_max_requests_per_sec = 1.0
+cdx_max_retries = 3
+tail_window_months = 24          # the late-life flip window, anchored on last_capture
+tail_min_captures = 3            # below this, divergence is None rather than noise
+
+gsb_base_url = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
+gsb_batch_size = 250             # API cap is 500 URLs; we send 2 schemes x domain
+gsb_timeout = 15.0
+gsb_threat_types = ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE",
+                    "POTENTIALLY_HARMFUL_APPLICATION"]
+gsb_platform_types = ["ANY_PLATFORM"]     # v4 REQUIRES all three lists. An empty or omitted list
+gsb_threat_entry_types = ["URL"]          # returns NO MATCHES rather than erroring - a silent
+                                          # false-clean, exactly the failure invariant 2 exists to
+                                          # prevent. Asserted in the spike and in tests.
+
+[toxicity.cache_days]
+reject = 30
+pass = 14
+unknown_no_history = 30
+# unknown_error is deliberately absent - it is NEVER cached.
+
 [sources.whoisfreaks]             # feed location (confirmed against the live repo 2026-07-14)
 base_url = "https://raw.githubusercontent.com/WhoisFreaks/daily-expired-and-dropped-domains/main"
 expired_filename = "{date}-free-expired-domains.csv"   # {date} -> YYYY-MM-DD

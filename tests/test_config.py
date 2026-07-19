@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
 
+from domainscout import config
 from domainscout.config import ConfigError, load_criteria
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -214,3 +216,37 @@ def test_comps_refresh_days_must_be_int(tmp_path):
     p.write_text(src.replace("refresh_days = 7", 'refresh_days = "weekly"'), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"\[comps\].refresh_days"):
         load_criteria(p)
+
+
+def test_toxicity_config_parsed(tmp_path):
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    assert crit.tox_cdx_base_url.startswith("https://")   # never plaintext
+    assert crit.tox_cdx_collapse == "timestamp:6"
+    assert crit.tox_tail_window_months == 24
+    assert crit.tox_tail_min_captures == 3
+    assert "ANY_PLATFORM" in crit.tox_gsb_platform_types
+    assert "URL" in crit.tox_gsb_threat_entry_types
+    assert crit.tox_cache_days["reject"] == 30
+    assert "unknown_error" not in crit.tox_cache_days   # NEVER cached
+
+
+def test_dotenv_does_not_clobber_real_env(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("GOOGLE_SAFE_BROWSING_API_KEY=from_file\nOTHER=alsofile\n", encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_SAFE_BROWSING_API_KEY", "from_real_env")
+    monkeypatch.delenv("OTHER", raising=False)
+    config.load_dotenv(env)
+    assert os.environ["GOOGLE_SAFE_BROWSING_API_KEY"] == "from_real_env"  # real env WINS
+    assert os.environ["OTHER"] == "alsofile"                              # file fills gaps
+
+
+def test_dotenv_missing_file_is_not_an_error(tmp_path):
+    config.load_dotenv(tmp_path / "nope.env")   # must not raise
+
+
+def test_dotenv_skips_comments_and_strips_quotes(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text('# comment\n\nA="quoted"\nB=plain\n', encoding="utf-8")
+    monkeypatch.delenv("A", raising=False); monkeypatch.delenv("B", raising=False)
+    config.load_dotenv(env)
+    assert os.environ["A"] == "quoted" and os.environ["B"] == "plain"
