@@ -587,3 +587,74 @@ def test_cdx_client_404_is_not_retried():
     with pytest.raises(toxicity.CdxError):
         client.fetch("example.com")
     assert calls["n"] == 2
+
+
+def test_gsb_empty_response_means_not_listed_not_an_error():
+    """v4 returns a bare {} for a clean batch - absent 'matches' key. Parsing that as
+    malformed would turn every clean run into unknown_error."""
+    def handler(request):
+        return httpx.Response(200, json={})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    got = toxicity.GsbClient(_fake_client(handler), crit, "k").check(["a.com", "b.com"])
+    assert got["a.com"].currently_listed is False
+    assert got["b.com"].currently_listed is False
+
+
+def test_gsb_match_marks_only_the_matched_domain():
+    def handler(request):
+        return httpx.Response(200, json={"matches": [
+            {"threatType": "MALWARE", "threat": {"url": "http://bad.com/"}}]})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    got = toxicity.GsbClient(_fake_client(handler), crit, "k").check(["bad.com", "ok.com"])
+    assert got["bad.com"].currently_listed is True
+    assert got["bad.com"].threat_types == ("MALWARE",)
+    assert got["ok.com"].currently_listed is False
+
+
+def test_gsb_request_always_carries_all_three_non_empty_lists():
+    """v4 requires threatTypes, platformTypes AND threatEntryTypes. An empty list
+    returns NO MATCHES rather than an error - a silent false-clean, which is the exact
+    failure invariant 2 exists to prevent."""
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    toxicity.GsbClient(_fake_client(handler), crit, "k").check(["a.com"])
+    info = seen["body"]["threatInfo"]
+    assert info["threatTypes"] and info["platformTypes"] and info["threatEntryTypes"]
+
+
+def test_gsb_queries_both_url_schemes():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    toxicity.GsbClient(_fake_client(handler), crit, "k").check(["a.com"])
+    urls = {e["url"] for e in seen["body"]["threatInfo"]["threatEntries"]}
+    assert urls == {"http://a.com/", "https://a.com/"}
+
+
+def test_gsb_403_and_400_are_distinguishable():
+    def make(status):
+        return lambda request: httpx.Response(status, json={"error": {"message": "no"}})
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    for status, needle in ((403, "key"), (400, "request")):
+        with pytest.raises(toxicity.GsbError) as exc:
+            toxicity.GsbClient(_fake_client(make(status)), crit, "k").check(["a.com"])
+        assert needle in str(exc.value).lower()
+
+
+def test_gsb_from_env_raises_clean_error_without_a_key(monkeypatch):
+    monkeypatch.delenv("GOOGLE_SAFE_BROWSING_API_KEY", raising=False)
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    with pytest.raises(toxicity.ToxicityKeyMissing):
+        toxicity.GsbClient.from_env(_fake_client(lambda r: httpx.Response(200, json={})), crit)

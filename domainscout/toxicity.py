@@ -348,3 +348,87 @@ class CdxClient:
         # canonicalize them to the same record entirely). bucket_monthly re-sorts, so
         # merge order does not matter.
         return list({(c.timestamp, c.digest): c for c in captures}.values())
+
+
+GSB_KEY_ENV = "GOOGLE_SAFE_BROWSING_API_KEY"
+
+
+class GsbClient:
+    """Google Safe Browsing v4 threatMatches:find.
+
+    Batches up to 500 URLs per request, so an entire day's screen is ONE call and the
+    rate-limit surface is effectively nil. Both http:// and https:// forms are sent per
+    domain: canonicalization usually makes a host-level entry match either, but at 60
+    URLs against a 500 cap it is free insurance for the case where it does not."""
+
+    def __init__(self, client: httpx.Client, criteria, api_key: str):
+        self.client = client
+        self.criteria = criteria
+        self.api_key = api_key
+
+    @classmethod
+    def from_env(cls, client: httpx.Client, criteria) -> "GsbClient":
+        key = os.environ.get(GSB_KEY_ENV, "").strip()
+        if not key:
+            raise ToxicityKeyMissing(
+                f"{GSB_KEY_ENV} is not set. Safe Browsing needs a free Google Cloud API "
+                f"key (no billing account required). Put it in .env - see .env.example.")
+        return cls(client, criteria, key)
+
+    def check(self, domains: Sequence[str]) -> dict:
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        results = {d: GsbResult(False, (), checked_at) for d in domains}
+        if not domains:
+            return results
+        per_domain = 2                      # http + https
+        chunk = max(1, self.criteria.tox_gsb_batch_size // per_domain)
+        for start in range(0, len(domains), chunk):
+            batch = list(domains)[start:start + chunk]
+            hits = self._find(batch)
+            for domain, threats in hits.items():
+                results[domain] = GsbResult(True, tuple(sorted(threats)), checked_at)
+        return results
+
+    def _find(self, batch: Sequence[str]) -> dict:
+        entries = [{"url": f"{scheme}://{d}/"} for d in batch for scheme in ("http", "https")]
+        body = {
+            "client": {"clientId": "domainscout", "clientVersion": "0.1"},
+            "threatInfo": {
+                # All THREE lists must be present AND non-empty: v4 answers an empty
+                # list with NO MATCHES rather than an error - a silent false-clean.
+                "threatTypes": list(self.criteria.tox_gsb_threat_types),
+                "platformTypes": list(self.criteria.tox_gsb_platform_types),
+                "threatEntryTypes": list(self.criteria.tox_gsb_threat_entry_types),
+                "threatEntries": entries,
+            },
+        }
+        if not (body["threatInfo"]["threatTypes"] and body["threatInfo"]["platformTypes"]
+                and body["threatInfo"]["threatEntryTypes"]):
+            raise GsbError("refusing to send an empty threatTypes/platformTypes/"
+                           "threatEntryTypes list - it returns no matches, not an error")
+        try:
+            resp = self.client.post(self.criteria.tox_gsb_base_url,
+                                    params={"key": self.api_key}, json=body,
+                                    timeout=self.criteria.tox_gsb_timeout)
+        except httpx.TransportError as exc:
+            raise GsbError(f"safe-browsing transport failure: {exc}") from exc
+        if resp.status_code == 403:
+            raise GsbError("safe-browsing rejected the API key (403) - key invalid, "
+                           "Safe Browsing API not enabled, or quota exhausted")
+        if resp.status_code == 400:
+            raise GsbError("safe-browsing rejected the request (400) - malformed body, "
+                           "which is our bug, not a configuration problem")
+        if resp.status_code != 200:
+            raise GsbError(f"safe-browsing HTTP {resp.status_code}")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise GsbError(f"safe-browsing returned non-JSON: {exc}") from exc
+        # A clean batch is a BARE {} with no 'matches' key. Absent == not listed.
+        hits: dict = {}
+        for match in payload.get("matches", []) or []:
+            url = (match.get("threat") or {}).get("url", "")
+            for domain in batch:
+                if f"//{domain}/" in url or url.rstrip("/").endswith(f"//{domain}"):
+                    hits.setdefault(domain, set()).add(match.get("threatType", "UNKNOWN"))
+        return hits
