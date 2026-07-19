@@ -250,3 +250,30 @@ def test_dotenv_skips_comments_and_strips_quotes(tmp_path, monkeypatch):
     monkeypatch.delenv("A", raising=False); monkeypatch.delenv("B", raising=False)
     config.load_dotenv(env)
     assert os.environ["A"] == "quoted" and os.environ["B"] == "plain"
+
+
+def test_tox_tail_window_months_is_read(tmp_path):
+    """Verifies that [toxicity] config is actually parsed, not silently defaulted."""
+    src = (REPO_ROOT / "criteria.toml").read_text(encoding="utf-8")
+    p = tmp_path / "c.toml"
+    p.write_text(src.replace("tail_window_months = 24", "tail_window_months = 36"), encoding="utf-8")
+    crit = load_criteria(p)
+    assert crit.tox_tail_window_months == 36
+
+
+def test_tox_cdx_base_url_requires_https(tmp_path):
+    """Guards against plaintext Wayback CDX access (should only use TLS via truststore)."""
+    src = (REPO_ROOT / "criteria.toml").read_text(encoding="utf-8")
+    p = tmp_path / "c.toml"
+    p.write_text(src.replace("https://web.archive.org", "http://web.archive.org"), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"\[toxicity\].cdx_base_url must be https://"):
+        load_criteria(p)
+
+
+def test_tox_cache_days_rejects_unknown_error(tmp_path):
+    """Enforces that transient failures are never cached (forced retry on next run)."""
+    src = (REPO_ROOT / "criteria.toml").read_text(encoding="utf-8")
+    p = tmp_path / "c.toml"
+    p.write_text(src.replace("reject = 30", "reject = 30\nunknown_error = 5"), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"\[toxicity.cache_days\].unknown_error must NOT be set"):
+        load_criteria(p)
