@@ -307,9 +307,17 @@ class CdxClient:
                                        timeout=self.criteria.tox_cdx_timeout)
                 if resp.status_code >= 500 or resp.status_code == 429:
                     last = CdxError(f"CDX HTTP {resp.status_code}")
-                else:
-                    resp.raise_for_status()
+                elif resp.status_code == 200:
                     return resp.json() or []
+                else:
+                    # Non-retryable: raise CdxError IMMEDIATELY, do not burn the retry
+                    # budget or sleep. httpx.HTTPStatusError is a SIBLING of
+                    # TransportError under HTTPError, not a subclass, so
+                    # resp.raise_for_status() here would escape both the except clause
+                    # below AND fetch()'s `except CdxError` - aborting the whole batch
+                    # (and skipping the second host, if this was the first) instead of
+                    # being recorded as this one host's failure.
+                    raise CdxError(f"CDX HTTP {resp.status_code} for {params['url']}")
             except (httpx.TransportError, ValueError) as exc:
                 last = exc
             self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))

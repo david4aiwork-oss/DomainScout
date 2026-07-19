@@ -543,3 +543,47 @@ def test_cdx_client_raises_on_5xx_after_retries():
     # domain is declared a failure.
     assert calls["n"] == crit.tox_cdx_max_retries * 2
     assert slept and all(s > 0 for s in slept)          # real backoff, just not real waiting
+
+
+def test_cdx_client_one_host_404_does_not_fail_the_domain():
+    """A non-retryable status (404) on ONE host must not abort the domain: the OTHER
+    host's captures are still returned, mirroring the existing 503-on-one-host test."""
+    def handler(request):
+        if request.url.params["url"].startswith("www."):
+            return httpx.Response(404)
+        return httpx.Response(200, json=[["timestamp", "statuscode", "mimetype", "digest"],
+                                         ["20200115120000", "200", "text/html", "A"]])
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    caps = toxicity.CdxClient(_fake_client(handler), crit,
+                              sleep=lambda s: None).fetch("example.com")
+    assert [c.digest for c in caps] == ["A"]
+
+
+def test_cdx_client_404_on_both_hosts_raises_cdx_error_not_http_status_error():
+    """httpx.HTTPStatusError is a SIBLING of TransportError under HTTPError, not a
+    subclass - a bare resp.raise_for_status() would let it escape as the wrong
+    exception type. fetch() must raise toxicity.CdxError, never the raw httpx type."""
+    def handler(request):
+        return httpx.Response(404)
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=lambda s: None)
+    with pytest.raises(toxicity.CdxError):
+        client.fetch("example.com")
+
+
+def test_cdx_client_404_is_not_retried():
+    """A non-retryable status must not burn the retry budget: exactly one call per
+    host (2 total), unlike the 5xx case above which retries max_retries times per host."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(404)
+
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    client = toxicity.CdxClient(_fake_client(handler), crit, sleep=lambda s: None)
+    with pytest.raises(toxicity.CdxError):
+        client.fetch("example.com")
+    assert calls["n"] == 2

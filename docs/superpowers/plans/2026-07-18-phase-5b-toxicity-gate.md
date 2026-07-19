@@ -1294,9 +1294,17 @@ class CdxClient:
                                        timeout=self.criteria.tox_cdx_timeout)
                 if resp.status_code >= 500 or resp.status_code == 429:
                     last = CdxError(f"CDX HTTP {resp.status_code}")
-                else:
-                    resp.raise_for_status()
+                elif resp.status_code == 200:
                     return resp.json() or []
+                else:
+                    # Non-retryable: raise CdxError IMMEDIATELY, do not burn the retry
+                    # budget or sleep. httpx.HTTPStatusError is a SIBLING of
+                    # TransportError under HTTPError, not a subclass, so
+                    # resp.raise_for_status() here would escape both the except clause
+                    # below AND fetch()'s `except CdxError` - aborting the whole batch
+                    # (and skipping the second host, if this was the first) instead of
+                    # being recorded as this one host's failure.
+                    raise CdxError(f"CDX HTTP {resp.status_code} for {params['url']}")
             except (httpx.TransportError, ValueError) as exc:
                 last = exc
             self.sleep(min(2 ** attempt, 8) / max(self.criteria.tox_cdx_max_rps, 0.1))
@@ -1328,6 +1336,18 @@ class CdxClient:
         # merge order does not matter.
         return list({(c.timestamp, c.digest): c for c in captures}.values())
 ```
+
+**Post-ship fix (CRITICAL, fixed in the commit that shipped this task):** the first version of
+`_get` called `resp.raise_for_status()` inside a `try` whose `except` caught
+`(httpx.TransportError, ValueError)`. `httpx.HTTPStatusError` is a SIBLING of
+`TransportError` under `HTTPError`, not a subclass, so on any non-retryable non-2xx
+status that wasn't 429/5xx (e.g. 400, 403, 404), the raw `HTTPStatusError` escaped
+`_get` uncaught, then escaped `fetch()`'s per-host `except CdxError` because it isn't a
+`CdxError` - violating `fetch()`'s own docstring contract and, if it hit the first host,
+aborting before the second host was ever tried. The code block above already reflects
+the fix: explicit status handling (`>= 500` or `429` retryable, `200` parses and
+returns, anything else raises `CdxError` immediately without burning the retry budget
+or sleeping).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
