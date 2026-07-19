@@ -15,6 +15,7 @@ import calendar
 import json
 import os
 import time
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -459,3 +460,100 @@ class GsbClient:
                 if f"//{domain}/" in url or url.rstrip("/").endswith(f"//{domain}"):
                     hits.setdefault(domain, set()).add(match.get("threatType", "UNKNOWN"))
         return hits
+
+
+def screen(domains: Sequence[str], *, cdx, gsb, criteria,
+           cache: VerdictCache | None = None,
+           now: datetime | None = None) -> list[ToxicityVerdict]:
+    """Screen domains. Returns ONE verdict per input domain, IN INPUT ORDER.
+
+    A live cache hit short-circuits BOTH legs - no CDX call, and the domain is excluded
+    from the GSB batch entirely."""
+    moment = now or datetime.now()
+    stamp = moment.isoformat(timespec="seconds")
+    verdicts: dict = {}
+
+    pending = []
+    for domain in domains:
+        hit = cache.get(domain) if cache else None
+        if hit is not None:
+            verdicts[domain] = hit
+        else:
+            pending.append(domain)
+
+    # CDX first: a per-domain failure is captured, never raised out of the batch.
+    shapes: dict = {}
+    errors: dict = {d: [] for d in pending}
+    for domain in pending:
+        try:
+            shapes[domain] = compute_shape(
+                cdx.fetch(domain),
+                tail_window_months=criteria.tox_tail_window_months,
+                tail_min_captures=criteria.tox_tail_min_captures)
+        except CdxError as exc:
+            shapes[domain] = None
+            errors[domain].append(f"cdx: {exc}")
+
+    # GSB second, one batched call. GsbClient.check() (Task 9, fixed post-review) raises
+    # GsbError only when EVERY chunk failed; a PARTIAL chunk failure instead returns a
+    # dict that simply OMITS the domains whose chunk failed - it does not raise in that
+    # case. Either way, a domain missing from gsb_results must become an error here, NOT
+    # a silent pass: absence means "GSB never checked this domain," never "checked, not
+    # listed." Skipping this second loop - e.g. leaving `result = gsb_results.get(domain)`
+    # as None with no error appended - would let decide(None, shape, []) return pass (or
+    # unknown_no_history) for a domain GSB never actually screened: a false negative on
+    # the hard-reject leg, exactly the failure mode Task 9's fix exists to prevent.
+    gsb_results: dict = {}
+    if pending:
+        try:
+            gsb_results = gsb.check(pending)
+        except GsbError as exc:
+            for domain in pending:
+                errors[domain].append(f"safe-browsing: {exc}")
+        else:
+            for domain in pending:
+                if domain not in gsb_results:
+                    errors[domain].append(
+                        "safe-browsing: not checked (its GSB chunk failed - see "
+                        "GsbClient.check)")
+
+    for domain in pending:
+        result = gsb_results.get(domain)
+        verdict, reason = decide(result, shapes.get(domain), errors[domain])
+        built = ToxicityVerdict(
+            domain=domain, verdict=verdict, reason=reason, gsb=result,
+            history=shapes.get(domain), screened_at=stamp,
+            collapse=criteria.tox_cdx_collapse)
+        verdicts[domain] = built
+        if cache:
+            cache.put(built)
+    if cache:
+        cache.save()
+    return [verdicts[d] for d in domains]
+
+
+def verdict_to_json(verdict: ToxicityVerdict) -> str:
+    """The 5c prompt payload. The Safe Browsing field is gsb_currently_listed - never
+    'clean', never 'safe'. GSB lists CURRENTLY flagged URLs, so a False means 'not
+    presently listed', and a dropped domain that served malware years ago may well have
+    aged off. Naming it defensively is what stops a future prompt from presenting a
+    snapshot as verified safety."""
+    return json.dumps({
+        "domain": verdict.domain,
+        "verdict": verdict.verdict,
+        "reason": verdict.reason,
+        "gsb_currently_listed": (verdict.gsb.currently_listed if verdict.gsb else None),
+        "gsb_threat_types": (list(verdict.gsb.threat_types) if verdict.gsb else []),
+        "gsb_checked_at": (verdict.gsb.checked_at if verdict.gsb else None),
+        "history": (_shape_to_dict(verdict.history) if verdict.history else None),
+        "screened_at": verdict.screened_at,
+        "collapse": verdict.collapse,
+    })
+
+
+def _shape_to_dict(shape: HistoryShape) -> dict:
+    return {
+        "lifetime": asdict(shape.lifetime),
+        "tail": asdict(shape.tail) if shape.tail else None,
+        "divergence": asdict(shape.divergence) if shape.divergence else None,
+    }

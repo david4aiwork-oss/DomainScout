@@ -720,3 +720,118 @@ def test_gsb_check_all_chunks_failing_raises_gsberror():
     domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
     with pytest.raises(toxicity.GsbError):
         toxicity.GsbClient(_fake_client(handler), crit, "k").check(domains)
+
+
+class _FakeCdx:
+    def __init__(self, by_domain): self.by_domain = by_domain; self.calls = []
+    def fetch(self, domain):
+        self.calls.append(domain)
+        value = self.by_domain.get(domain, [])
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class _FakeGsb:
+    def __init__(self, listed=(), error=None): self.listed = set(listed); self.error = error; self.calls = []
+    def check(self, domains):
+        self.calls.append(list(domains))
+        if self.error:
+            raise self.error
+        return {d: models.GsbResult(d in self.listed, ("MALWARE",) if d in self.listed else (),
+                                    "2026-07-18") for d in domains}
+
+
+def test_screen_returns_one_verdict_per_domain_in_input_order():
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    out = toxicity.screen(["b.com", "a.com"], cdx=_FakeCdx({}), gsb=_FakeGsb(), criteria=crit)
+    assert [v.domain for v in out] == ["b.com", "a.com"]
+
+
+def test_screen_gsb_ok_cdx_error_keeps_the_gsb_result():
+    """Verdict reflects the worst leg; data reflects every leg that succeeded. The
+    obvious wrong implementation nulls everything on any error and throws away work
+    that was already paid for."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    cdx = _FakeCdx({"a.com": toxicity.CdxError("timeout")})
+    v = toxicity.screen(["a.com"], cdx=cdx, gsb=_FakeGsb(), criteria=crit)[0]
+    assert v.verdict == models.VERDICT_UNKNOWN_ERROR
+    assert v.gsb is not None and v.gsb.currently_listed is False
+
+
+def test_screen_cdx_ok_gsb_error_keeps_the_history():
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    caps = [models.Capture(f"20{y}0115120000", "200", "text/html", f"D{y}")
+            for y in range(10, 21)]
+    v = toxicity.screen(["a.com"], cdx=_FakeCdx({"a.com": caps}),
+                        gsb=_FakeGsb(error=toxicity.GsbError("boom")), criteria=crit)[0]
+    assert v.verdict == models.VERDICT_UNKNOWN_ERROR
+    assert v.history is not None and v.history.lifetime.capture_count == 11
+
+
+def test_screen_listed_domain_is_rejected_and_skips_nothing_else():
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    v = toxicity.screen(["bad.com"], cdx=_FakeCdx({}), gsb=_FakeGsb(listed=["bad.com"]),
+                        criteria=crit)[0]
+    assert v.verdict == models.VERDICT_REJECT
+
+
+def test_screen_cache_hit_skips_both_legs_and_the_gsb_batch(tmp_path):
+    """A live cache hit must cost NO network on either leg, and the domain must not
+    even appear in the GSB batch."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse=crit.tox_cdx_collapse, now=now)
+    cache.put(models.ToxicityVerdict("a.com", models.VERDICT_PASS, "cached", None, None,
+                                     now.isoformat(), crit.tox_cdx_collapse))
+    cdx, gsb = _FakeCdx({}), _FakeGsb()
+    out = toxicity.screen(["a.com", "b.com"], cdx=cdx, gsb=gsb, criteria=crit,
+                          cache=cache, now=now)
+    assert cdx.calls == ["b.com"]
+    assert gsb.calls == [["b.com"]]
+    assert [v.domain for v in out] == ["a.com", "b.com"]
+
+
+def test_verdict_json_names_the_gsb_field_currently_listed():
+    """Field names are prompts. If this serializes as 'clean' or 'safe', a future
+    Tier-2 prompt can present a blocklist snapshot as verified safety."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    v = toxicity.screen(["a.com"], cdx=_FakeCdx({}), gsb=_FakeGsb(), criteria=crit)[0]
+    payload = json.loads(toxicity.verdict_to_json(v))
+    assert payload["gsb_currently_listed"] is False
+    blob = json.dumps(payload).lower()
+    assert "clean" not in blob and '"safe"' not in blob
+    assert payload["collapse"] == crit.tox_cdx_collapse
+
+
+class _FakePartialGsb:
+    """Simulates GsbClient.check()'s post-Task-9-fix contract directly: a partially
+    failed batch returns a dict that OMITS the domains whose chunk failed, WITHOUT
+    raising (check() only raises when every chunk failed). This is what screen() sees
+    on a real partial GSB outage, and is not exercised by _FakeGsb above, which only
+    ever fully succeeds or fully raises."""
+    def __init__(self, omit): self.omit = set(omit); self.calls = []
+    def check(self, domains):
+        self.calls.append(list(domains))
+        return {d: models.GsbResult(False, (), "2026-07-18")
+                for d in domains if d not in self.omit}
+
+
+def test_screen_gsb_partial_chunk_failure_marks_only_that_domain_unknown_error():
+    """One chunk failed -> that domain is unknown_error while a domain from the
+    succeeded chunk keeps its result. This is the false-negative guard one layer up
+    from Task 9's: if screen() read a missing gsb_results entry as `result = None` and
+    passed it straight to decide() with no error appended, decide(None, shape, [])
+    would return pass or unknown_no_history for a.com - a domain GSB never actually
+    screened. b.com's chunk succeeded, so its real (not-listed) GsbResult must ride
+    through untouched, exactly as the existing gsb-ok/cdx-error test proves for the
+    other leg."""
+    crit = load_criteria(REPO_ROOT / "criteria.toml")
+    gsb = _FakePartialGsb(omit=["a.com"])   # a.com's chunk failed; b.com's succeeded
+    out = toxicity.screen(["a.com", "b.com"], cdx=_FakeCdx({}), gsb=gsb, criteria=crit)
+    by_domain = {v.domain: v for v in out}
+    assert by_domain["a.com"].verdict == models.VERDICT_UNKNOWN_ERROR
+    assert by_domain["a.com"].gsb is None
+    assert by_domain["b.com"].gsb is not None
+    assert by_domain["b.com"].gsb.currently_listed is False
