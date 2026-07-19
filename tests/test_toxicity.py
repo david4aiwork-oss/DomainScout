@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -296,8 +297,6 @@ def test_decide_gsb_none_guards_against_null_dereference():
     assert "safe-browsing: boom" in reason
 
 
-from datetime import datetime, timedelta
-
 _DAYS = {"reject": 30, "pass": 14, "unknown_no_history": 30}
 
 
@@ -361,3 +360,93 @@ def test_cache_tolerates_a_corrupt_file(tmp_path):
     cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
                                   collapse="timestamp:6", now=datetime(2026, 7, 18))
     assert cache.get("a.com") is None
+
+
+def test_cache_ttl_boundary_is_miss(tmp_path):
+    """Entry exactly ttl days old is a MISS to prevent >= vs > refactor silent extension."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    # Pass verdict has TTL of 14 days
+    cache.put(_verdict("a.com", models.VERDICT_PASS, screened_at=now.isoformat()))
+    cache.save()
+    # Reopen at exactly 14 days later - should be a miss
+    stale = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now + timedelta(days=14))
+    assert stale.get("a.com") is None
+
+
+def test_cache_unknown_verdict_string_is_miss(tmp_path):
+    """Future version with unknown verdict string must not crash, only miss cache."""
+    cache_file = tmp_path / "c.json"
+    # Hand-write a cache with a verdict not in cache_days
+    cache_file.write_text(json.dumps({
+        "a.com": {
+            "verdict": "quarantined",
+            "reason": "test",
+            "screened_at": "2026-07-18T00:00:00",
+            "collapse": "timestamp:6"
+        }
+    }), encoding="utf-8")
+    cache = toxicity.VerdictCache(cache_file, cache_days=_DAYS,
+                                  collapse="timestamp:6", now=datetime(2026, 7, 18))
+    assert cache.get("a.com") is None
+
+
+def test_cache_non_dict_entry_is_miss(tmp_path):
+    """Hand-edited cache with bare string instead of dict entry must not crash."""
+    cache_file = tmp_path / "c.json"
+    # Hand-write corrupted cache with bare string entry
+    cache_file.write_text(json.dumps({
+        "a.com": "corrupted",
+        "b.com": {"verdict": "pass", "reason": "", "screened_at": "2026-07-18T00:00:00", "collapse": "timestamp:6"}
+    }), encoding="utf-8")
+    cache = toxicity.VerdictCache(cache_file, cache_days=_DAYS,
+                                  collapse="timestamp:6", now=datetime(2026, 7, 18))
+    assert cache.get("a.com") is None
+    # Good entry still works
+    assert cache.get("b.com").verdict == models.VERDICT_PASS
+
+
+def test_cache_save_osrc_does_not_raise(tmp_path, monkeypatch, capsys):
+    """Windows AV file-lock during rename is NOT theoretical - 5a hit it.
+    OSError must be caught and warned, not propagated."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    cache.put(_verdict("a.com", models.VERDICT_PASS, screened_at=now.isoformat()))
+
+    # Monkeypatch os.replace to raise OSError
+    def mock_replace(src, dst):
+        raise OSError("locked")
+    monkeypatch.setattr("os.replace", mock_replace)
+
+    # save() must NOT raise
+    cache.save()
+
+    # Verify warning was printed
+    captured = capsys.readouterr()
+    assert "toxicity: WARNING" in captured.out
+
+    # Verify the output encodes to cp1252 (Windows console safety)
+    captured.out.encode("cp1252")  # must not raise
+
+
+def test_cache_reason_survives_roundtrip(tmp_path):
+    """Reason field must survive save/reload cycle, not just verdict."""
+    now = datetime(2026, 7, 18)
+    cache = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                  collapse="timestamp:6", now=now)
+    distinctive_reason = "site flipped to gambling then defunct"
+    verdict = models.ToxicityVerdict(
+        domain="a.com", verdict=models.VERDICT_PASS, reason=distinctive_reason,
+        gsb=_NOT_LISTED, history=None,
+        screened_at=now.isoformat(), collapse="timestamp:6")
+    cache.put(verdict)
+    cache.save()
+
+    reopened = toxicity.VerdictCache(tmp_path / "c.json", cache_days=_DAYS,
+                                     collapse="timestamp:6", now=now)
+    retrieved = reopened.get("a.com")
+    assert retrieved is not None
+    assert retrieved.reason == distinctive_reason
