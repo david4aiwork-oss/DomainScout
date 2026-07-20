@@ -214,6 +214,25 @@ list. The field is therefore named **`gsb_currently_listed: false`** — and the
 `safe` appear **nowhere** in the emitted JSON. Field names are prompts too: 5c must not be able to present
 this as verified-safe even if a future prompt author forgets the caveat.
 
+### Scope limit — the GSB leg is a **host-level** check (measured 2026-07-20)
+
+Not an invariant but a boundary on what invariant 3's snapshot actually covers, so it sits here rather than
+in a footnote. `_find` probes the bare forms `http://{domain}/` and `https://{domain}/`. GSB v4 expands a
+lookup URL into host-suffix / path-prefix combinations, and `http://d/` expands only to `d/` and `d` — so a
+blocklist entry stored at `d/some/path/` **cannot** match. Confirmed live: a host with an active MALWARE
+listing at a path returned `currently_listed=False` for its bare forms.
+
+`threatMatches:find` takes URLs, not hosts; there is no "is anything under this host listed?" query, so this
+is an API boundary rather than a bug in the probe. **Practical meaning:** wholly-malicious domains (commonly
+host-listed) are caught; **path-scoped** listings — the characteristic shape for *compromised legitimate
+sites*, which is a real slice of this pipeline's target population — are not. How often that bites real
+expired .coms is **unmeasured**; the confirming test host is synthetic and path-listed by construction.
+
+**Owner ruling (2026-07-20): accept and document.** Path-scoped toxicity falls to the CDX history-shape
+signal and Tier-2 judgement. The alternative — injecting the top-N CDX-observed paths as extra
+`threatEntries` — was rejected for 5b because it would couple the two deliberately-independent legs and
+force a re-budget against the 500-URL cap. Reconsider if Phase-6 outcomes show path-scoped misses mattering.
+
 ---
 
 ## Caching
@@ -459,7 +478,16 @@ found. Record rate limits, error modes, payload sizes, and pagination behaviour.
 
 </details>
 
-### Spike objective 2 — GSB request/response shapes
+### Spike objective 2 — ✅ RESOLVED 2026-07-20: shapes confirmed; empty-list premise measured
+
+> Ran against the real API once the Console blocker cleared — see `PHASE-5B-SPIKE.md` Part 3 (A1–A4).
+> Clean batch is a bare `'{}\n'`; a match carries `{threatType, platformType, threat:{url},
+> cacheDuration, threatEntryType}`; the URL echo is byte-identical to what was sent (A3, the phase's
+> top residual risk, closed favourably). The empty-list premise below holds, with one correction: the
+> silent false-clean occurs on empty **`threatTypes`** and **`platformTypes`**, while an empty
+> **`threatEntryTypes`** still returned its match (the API appears to default it). The guard refuses
+> all three anyway — refusing a harmless case is free, and the defaulting is undocumented.
+> The same run surfaced the **host-level-only** scope limit recorded above.
 
 Confirm the batch cap and quota behaviour, plus two specific shapes:
 
@@ -484,7 +512,10 @@ Recorded here so it does not evaporate between sub-phases.
    *not* in `toxicity.py`: it is a **quality** signal, not a toxicity one, it needs no network, and it
    already sits in the DB that 5c's selection query must read anyway. Putting it in `screen()` would break
    that function's clean network-signals-only boundary (owner ruling, 2026-07-18).
-2. **`gsb_currently_listed` must be presented as a snapshot**, never as verified-safe.
+2. **`gsb_currently_listed` must be presented as a snapshot**, never as verified-safe — and, per the scope
+   limit measured 2026-07-20, as a **host-level** snapshot. A `false` means "this host is not itself listed
+   right now", **not** "nothing under this host is listed". The Tier-2 prompt must not let the model round
+   that up to a clean bill of health.
 3. **Tail-vs-lifetime divergence** interpretation belongs in the Tier-2 prompt.
 4. **`unknown_error` and `unknown_no_history` must be weighted differently** — transient ignorance vs.
    stable, mildly reassuring absence.

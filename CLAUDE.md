@@ -76,7 +76,7 @@ Identity = surrogate `id` PK + partial unique index `UNIQUE(domain) WHERE lifecy
 - [x] Phase 4: RDAP verification (whodap async, Verisign-direct, status-driven drop dates, re-verify open rows; DoH recorded-signal)
 - [ ] Phase 5: AI scoring — split into 5a/5b/5c (see docs/PHASE-5A-DESIGN.md)
   - [x] Phase 5a: comps grounding (NameBio free stats; cached CSV + local lookup; $0, no API key)
-  - [ ] Phase 5b: toxicity gate (Wayback CDX + Safe Browsing; needs a free Google Cloud key)
+  - [x] Phase 5b: toxicity gate (Wayback CDX + Safe Browsing; free Google Cloud key). Note: the GSB leg is a **host-level** check — path-scoped listings are not detected (owner-accepted 2026-07-20; see docs/PHASE-5B-DESIGN.md)
   - [ ] Phase 5c: two-tier scoring core (Haiku triage → Sonnet deep, Batch API; NEEDS an Anthropic API key)
 - [ ] Phase 6: outcomes tracker
 - [ ] Phase 7: daily digest

@@ -376,3 +376,138 @@ data, including the cache-hit-fidelity fix. The GSB/hard-reject half cannot be c
 session — it needs a Google Cloud Console fix (enable the Safe Browsing API / adjust API-key
 restrictions for the project behind the current key) before A1–A4 can be completed, and A3 in
 particular must be re-run and resolved before the gate is trusted to catch a real listed domain.**
+
+> **SUPERSEDED by Part 3 (2026-07-20).** The Console fix landed; A1–A4 are now all resolved against
+> the real API. Part 2's GSB rows above are retained as the historical record of the blocked session.
+
+---
+
+## Part 3 — Safe Browsing unblocked; A1–A4 resolved (2026-07-20)
+
+**Context:** an unscheduled reboot ended the previous session mid-flight. A full audit at the start of
+this one found the repo intact (clean tree, `git fsck` clean, 282 passed / 3 skipped, DB
+`integrity_check: ok`, still 29 commits ahead of `origin/main`) — nothing was lost. The owner then
+corrected the Google Cloud configuration, and the Safe Browsing leg ran for the first time.
+
+**The blocker is cleared.** `threatMatches:find` now returns HTTP 200. Both Part-2 causes had to be
+fixed: the API needed enabling on the project *and* the key's API-restriction allowlist needed Safe
+Browsing added — the two 403 bodies observed in Part 2 (`SERVICE_DISABLED`, `API_KEY_SERVICE_BLOCKED`)
+were two real, separate misconfigurations, not one error reported inconsistently.
+
+### A3 — URL echo format: ✅ RESOLVED, favourably
+
+The highest-risk open question in the phase. **Google echoes `threat.url` byte-identical to what was
+submitted, scheme included:**
+
+```
+sent   : http://malware.testing.google.test/testing/malware/
+echoed : 'http://malware.testing.google.test/testing/malware/'
+```
+
+The feared scheme-less canonical echo does **not** occur, so `_find`'s attribution test
+(`f"//{domain}/" in url`, or the `rstrip("/").endswith(f"//{domain}")` fallback) attributes hits
+correctly. The concern that no unit test could catch this — because the fixtures encode the same
+assumption as the code — is discharged by observation against the live API rather than by another test.
+
+### A1 / A2 — clean and match payload shapes: ✅ CONFIRMED
+
+- **Clean batch** returns a bare `'{}\n'` — no `matches` key. `_find`'s `payload.get("matches", [])`
+  absent-key handling is correct, and the parser does not treat it as malformed.
+- **Match** returns `matches[]` entries of the shape
+  `{threatType, platformType, threat: {url}, cacheDuration, threatEntryType}`.
+
+### A4 — empty-list guard: ✅ PREMISE CONFIRMED, with a sharpening
+
+Run against a URL **known to be listed**, so 0 matches proves a silent false-clean rather than an
+ambiguous absence:
+
+| Request | Result |
+|---|---|
+| baseline (all three lists populated) | HTTP 200, **1 match** |
+| `threatTypes: []` | HTTP 200, **0 matches** — silent false-clean |
+| `platformTypes: []` | HTTP 200, **0 matches** — silent false-clean |
+| `threatEntryTypes: []` | HTTP 200, **1 match** — API appears to default it |
+
+The guard's premise holds and is now **measured, not assumed**. Sharpening worth recording: the
+false-clean danger is specific to **`threatTypes` and `platformTypes`**. An empty `threatEntryTypes`
+still matched, so the design note's blanket "an empty or omitted list returns no matches" is true of
+two of the three, not all three. The guard correctly refuses all three regardless — refusing a
+harmless case costs nothing, and the API's defaulting behaviour is undocumented and could change.
+
+### ⚠️ NEW FINDING — the GSB leg detects **host-level listings only**
+
+Surfaced by the same run, and a *different* failure mode than A3 predicted. `_find` probes only the
+bare forms `http://{domain}/` and `https://{domain}/`. Against a host with a live MALWARE listing:
+
+```
+sent: http://malware.testing.google.test/ | https://malware.testing.google.test/
+raw response: {}                                    <-- NO match
+
+GsbClient.check(['malware.testing.google.test'])
+  -> currently_listed=False  threats=()             <-- listed domain reads as not-listed
+```
+
+**Mechanism:** GSB v4 matches a lookup URL by expanding it into host-suffix / path-prefix
+combinations. `http://d/` expands only to `d/` and `d`, so it can never match a blocklist entry stored
+at `d/testing/malware/`. There is no "is anything under this host listed?" query in
+`threatMatches:find` — the API takes URLs, not hosts.
+
+**Scope, stated precisely.** This does not make the leg useless: wholly-malicious domains are commonly
+listed at host level and those still match. It is blind to **path-scoped** listings, which is the
+characteristic shape for *compromised legitimate sites* — and a legitimate site that was compromised
+and then expired is squarely in this pipeline's target population. Note also that the test host is a
+**synthetic** entry, path-listed by construction, so it demonstrates the mechanism cleanly but says
+nothing about how often this bites real expired .coms. That rate was **not** measured.
+
+**Owner ruling (2026-07-20): ACCEPT AND DOCUMENT.** The GSB leg is defined as a host-level check.
+Path-scoped toxicity is left to the CDX history-shape signal and to Tier-2 judgement. The considered
+alternative — feeding the top-N CDX-observed paths in as extra `threatEntries`, which is possible only
+because the CDX leg already retrieves real observed URLs — was rejected for 5b: it would make the GSB
+leg depend on CDX output (the two legs are deliberately independent) and force a re-budget against the
+500-URL batch cap. It remains available if Phase-6 outcomes show path-scoped misses mattering.
+
+This limitation is recorded in `PHASE-5B-DESIGN.md` (as a scope statement beside the three ratified
+invariants, and in *Forward-carried to 5c*) and as a comment on `_find`'s entry construction, so a
+future reader cannot mistake `gsb_currently_listed: false` for "no listing anywhere under this host".
+
+### B2 — never-archived domain, via the literal live path: ✅ NOW CLOSED
+
+Part 2 could only confirm invariant 1 via real-CDX + stub-GSB isolation, because the GSB outage pulled
+every live verdict to `unknown_error`. With the leg working, the unmodified end-to-end path was run
+(`screen --no-cache`, so nothing was cached and the run is repeatable):
+
+```
+python.org                   verdict=pass
+  lifetime: 19970501..20260701 span=29.2y n=314 churn=0.70
+  tail divergence: churn_ratio=1.1249 status_shift=+0.05 mime_shift=+0.05
+zylotrix.com                 verdict=pass
+  lifetime: 20241231..20250416 span=0.3y n=3 churn=0.33
+malware.testing.google.test  verdict=unknown_no_history
+  reason: no wayback captures - absence of evidence, not evidence of anything
+```
+
+**Invariant 1 confirmed on the real path:** a never-archived domain lands on `unknown_no_history` —
+distinct from both `pass` and `reject`, and no longer masked by `unknown_error`. Real history shapes
+populate correctly alongside a live GSB result, which is the phase's whole deliverable to 5c.
+
+Incidentally, this run also demonstrates the host-level limitation on live data rather than in the
+abstract: `malware.testing.google.test` reports `currently_listed=False` in the human summary despite
+carrying an active path-scoped MALWARE listing. That is the documented behaviour, not a regression —
+and it is precisely why the emitted field says `currently_listed` and never `clean`.
+
+### Part 3 summary
+
+| Check | Verdict |
+|---|---|
+| A1 clean-batch shape | ✅ PASS — bare `'{}\n'`, absent-key handling correct |
+| A2 match shape | ✅ PASS — `{threatType, platformType, threat:{url}, cacheDuration, threatEntryType}` |
+| **A3 URL echo format (was highest-risk)** | **✅ RESOLVED — byte-identical echo w/ scheme; attribution correct** |
+| A4 empty-list guard | ✅ PREMISE CONFIRMED — false-clean on empty `threatTypes`/`platformTypes`; `threatEntryTypes` defaults |
+| **B2 never-archived, literal live path** | **✅ NOW CLOSED — `unknown_no_history` reached for real; Part 2's gap filled** |
+| **GSB path-scoped listings** | **⚠️ KNOWN LIMITATION — host-level only; owner-accepted, documented** |
+
+**Overall: the GSB/hard-reject half is now confirmed working against the real API, and the phase's
+top residual false-negative risk (A3) is closed favourably. One new limitation was found, scoped, and
+accepted rather than silently carried. A5 (fixtures from real success data) was not pursued — the
+existing synthetic fixtures encode the shapes A1/A2 just confirmed, so re-deriving them adds no
+coverage; the real payloads are recorded above instead.**

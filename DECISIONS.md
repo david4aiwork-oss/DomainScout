@@ -172,6 +172,42 @@ no-op; live 429→refused-cache-intact; corrupt-header→refused. Decisions lock
 - **`modeled: null` reserved** in `value_range` from day one, so adding HumbleWorth later is a data change,
   not a schema migration. **NameBio attribution** carried on every `CompsContext` (licence condition → Phase 7).
 
+### 2026-07-20 — Phase 5b built: toxicity gate; GSB confirmed live; host-level scope accepted
+Phase 5b (Wayback CDX history shape + Google Safe Browsing) built and confirmed against real APIs
+(plan: `docs/superpowers/plans/2026-07-18-phase-5b-toxicity-gate.md`; design + build notes:
+`docs/PHASE-5B-DESIGN.md`; live findings: `docs/PHASE-5B-SPIKE.md` Parts 1–3). **Zero new dependencies.**
+282 tests pass + 3 skipped, zero network in the suite. Built subagent-driven (implementer + reviewer per
+task, opus final whole-branch review). The Safe Browsing leg was blocked through 2026-07-19 by a Google
+Cloud misconfiguration — **both** causes had to be fixed: the API needed enabling on the project *and* the
+key's API-restriction allowlist needed Safe Browsing added (the two 403 bodies seen were two separate
+problems, not one error reported inconsistently). Resolved 2026-07-20. Decisions and findings:
+- **A library, not a pipeline stage** (5a precedent) — Tier-1 decides who gets screened, and Tier-1 does not
+  exist until 5c.
+- **Asymmetric legs** — GSB is a hard reject (batched ≤500 URLs, so a day's screen is one call); CDX is a
+  graded signal for Tier-2. The legs are deliberately **independent**.
+- **A3 (top residual false-negative risk) closed favourably** — GSB echoes `threat.url` byte-identical to
+  what was sent, scheme included, so hit attribution is correct. This could not have been settled by any
+  unit test: the fixtures encode the same assumption as the code, so only live observation discharges it.
+- **⚠️ GSB is a HOST-LEVEL check — owner ruling: accept and document.** v4 expands a lookup URL into
+  host-suffix/path-prefix combinations, so the bare `scheme://domain/` probe cannot match a blocklist entry
+  stored at a path; a host with an active path-scoped MALWARE listing returns `currently_listed=False`.
+  `threatMatches:find` takes URLs, not hosts, so there is no "anything under this host?" query — an API
+  boundary, not a probe bug. Wholly-malicious (host-listed) domains are still caught; **path-scoped**
+  listings — the usual shape for *compromised legitimate sites*, a real slice of the target population —
+  are not. The real-world rate is **unmeasured**. Rejected alternative: injecting top-N CDX-observed paths
+  as extra `threatEntries` (couples the independent legs, re-budgets the 500 cap) — revisit if Phase-6
+  outcomes show path-scoped misses mattering. `gsb_currently_listed: false` therefore means "this host is
+  not itself listed right now", never "nothing under this host is listed"; 5c's prompt must not round up.
+- **Empty-list guard premise measured, not assumed** — against a URL known to be listed, empty `threatTypes`
+  and empty `platformTypes` each return 0 matches (silent false-cleans), while empty `threatEntryTypes` still
+  matched (v4 appears to default it). The guard refuses all three regardless: refusing the harmless case is
+  free, and the defaulting is undocumented.
+- **Invariants confirmed on the live path** — never-archived → `unknown_no_history` (distinct from `pass`
+  and from `reject`); and the earlier GSB outage incidentally live-validated invariant 2, pulling every
+  verdict to `unknown_error` rather than `pass`.
+- **Carried into 5c:** `screen()`'s injected `now` never reaches `VerdictCache.now`; 5c is the first caller
+  that will pass `now`, and a **future** `now` makes the TTL delta negative — a permanent cache hit.
+
 ### Accepted defaults (owner didn't object; cheap to change)
 - Daily digest: **local markdown file**, top **10** candidates, Tier-2 scoring cutoff ~**30** domains.
 

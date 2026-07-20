@@ -512,12 +512,29 @@ class GsbClient:
         return results
 
     def _find(self, batch: Sequence[str]) -> dict:
+        # HOST-LEVEL CHECK ONLY - measured against the live API 2026-07-20, owner-accepted.
+        # v4 expands a lookup URL into host-suffix/path-prefix combinations, and these bare
+        # forms expand to just `d/` and `d`. A blocklist entry stored at `d/some/path/`
+        # therefore CANNOT match: a real host with an active MALWARE listing at a path
+        # returned no match for its bare forms. `threatMatches:find` takes URLs, not hosts -
+        # there is no "anything under this host?" query - so this is an API boundary, not a
+        # bug here. Consequence: `currently_listed=False` means "this host is not itself
+        # listed right now", NOT "nothing under this host is listed". Path-scoped listings
+        # (the usual shape for COMPROMISED legitimate sites) fall to the CDX shape leg and
+        # Tier-2. Do not "fix" this by widening the probe without re-reading
+        # PHASE-5B-DESIGN.md - injecting CDX-observed paths was considered and rejected for
+        # 5b (it couples the two deliberately-independent legs and re-budgets the 500 cap).
         entries = [{"url": f"{scheme}://{d}/"} for d in batch for scheme in ("http", "https")]
         body = {
             "client": {"clientId": "domainscout", "clientVersion": "0.1"},
             "threatInfo": {
                 # All THREE lists must be present AND non-empty: v4 answers an empty
                 # list with NO MATCHES rather than an error - a silent false-clean.
+                # Measured 2026-07-20 against a URL known to be listed: empty
+                # threatTypes -> 0 matches, empty platformTypes -> 0 matches (both
+                # false-cleans), while empty threatEntryTypes still matched (v4 appears
+                # to default it). We refuse all three regardless - refusing the harmless
+                # case is free, and that defaulting is undocumented and could change.
                 "threatTypes": list(self.criteria.tox_gsb_threat_types),
                 "platformTypes": list(self.criteria.tox_gsb_platform_types),
                 "threatEntryTypes": list(self.criteria.tox_gsb_threat_entry_types),
