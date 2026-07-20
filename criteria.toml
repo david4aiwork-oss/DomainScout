@@ -108,7 +108,15 @@ cdx_match_type = "exact"         # MEASURED 2026-07-18 (spike, see PHASE-5B-SPIK
                                  # the contamination, and shape is the story of the front door.
 cdx_limit = 5000                 # Never engages under the ratified strategy - the worst-case domain
                                  # measured collapses to 311 rows. Kept as a runaway guard only.
-cdx_timeout = 20.0
+cdx_timeout = 20.0               # MEASURED 2026-07-19 (live confirmation, see PHASE-5B-SPIKE.md
+                                 # Part 2): single-shot exact+collapse GET latency observed 0.5s
+                                 # (never-archived domain) to 16.2s (www.wordpress.com, a busy
+                                 # modern site) - close enough to this timeout that an occasional
+                                 # retry under load is plausible (one wrapped call to the same host
+                                 # took 36.2s, consistent with one retry cycle, though not directly
+                                 # confirmed via a captured timeout event). cdx_max_retries below
+                                 # already tolerates this; recorded here so 20.0 isn't mistaken for
+                                 # generous headroom.
 cdx_max_requests_per_sec = 1.0   # paces BOTH the success path and the failure-path backoff
                                  # divisor (final-review fix: before it paced only the
                                  # latter, so a clean run issued its whole request burst -
@@ -118,6 +126,19 @@ cdx_max_requests_per_sec = 1.0   # paces BOTH the success path and the failure-p
 cdx_max_retries = 3
 tail_window_months = 24          # the late-life flip window, anchored on last_capture
 tail_min_captures = 3            # below this, divergence is None rather than noise
+
+# CDX limits - MEASURED across both spikes (2026-07-18 design spike + 2026-07-19 live
+# confirmation, see PHASE-5B-SPIKE.md): 0 HTTP 429/5xx observed across ~65 combined requests to
+# web.archive.org's CDX endpoint - "not yet hit," not "confirmed absent," per the original spike's
+# own caveat; this was never a dedicated saturation test.
+# apex vs www.: MEASURED byte-identical CDX responses (same (timestamp,digest) series) for 16/16
+# real domains tested across both sessions (cnn.com, python.org, stackoverflow.com, npmjs.com,
+# wordpress.com, medium.com, eff.org, archive.org, github.com, webvan.com, kozmo.com, boo.com,
+# flooz.com, theglobe.com, pseudo.com), including domains with a LIVE HTTP 301 between the two
+# hosts (e.g. python.org). archive.org's matchType=exact appears to canonicalize away the
+# www./apex distinction for every domain sampled so far - CdxClient's two-GET merge has not yet
+# actually merged two DIFFERENT series in practice. Kept as-is (cheap insurance, not yet proven
+# unnecessary), but do not assume the merge is load-bearing without re-checking this.
 
 gsb_base_url = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 gsb_batch_size = 250             # API cap is 500 URLs; we send 2 schemes x domain

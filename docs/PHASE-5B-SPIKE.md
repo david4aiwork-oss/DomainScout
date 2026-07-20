@@ -1,7 +1,10 @@
 # Phase 5b — Task 1 empirical spike: findings
 
-**Status: BLOCKED — the plan's assumed strategy (a)+(d) is refuted by measurement. Reported for
-owner re-planning per brief Step 9. Do not build Tasks 2–11 against (a)+(d) as currently specified.**
+**Status (Part 1, 2026-07-18): BLOCKED — the plan's assumed strategy (a)+(d) is refuted by
+measurement. Reported for owner re-planning per brief Step 9. Do not build Tasks 2–11 against
+(a)+(d) as currently specified.** This was subsequently resolved: `matchType=exact` + server-side
+`collapse=timestamp:6` was ratified (see `criteria.toml` `[toxicity]` and `toxicity.CdxClient`'s own
+docstring) and Phase 5b was built in full (282 tests, 3 skipped as of the live confirmation below).
 
 **Date:** 2026-07-18. **Domain used throughout:** `cnn.com` (the ~25-year, heavily-crawled worst case
 the brief calls for), plus a small scan of real defunct-dotcom domains and two invented never-registered
@@ -10,9 +13,12 @@ a bare `httpx` call fails TLS verification on this box). All network calls neede
 `dangerouslyDisableSandbox: true`; without it the tool sandbox silently drops the connection (hangs with
 zero output rather than raising an error) instead of failing fast.
 
-**Objective 2 (GSB): NOT YET RUN.** `.env` does not exist yet — `GOOGLE_SAFE_BROWSING_API_KEY` is absent.
-Per instruction, objective 1 was completed in full without waiting; GSB is left for a follow-up once the
-key lands.
+**Objective 2 (GSB): NOT YET RUN as of Part 1 (2026-07-18).** `.env` did not exist yet —
+`GOOGLE_SAFE_BROWSING_API_KEY` was absent. Per instruction, objective 1 was completed in full without
+waiting; GSB was left for a follow-up once the key landed. **UPDATE (2026-07-19, see Part 2 below):**
+the key has since landed, but Objective 2 is still not confirmed working — the Safe Browsing API
+itself is blocked at the Google Cloud project level for this key (HTTP 403). This is a BLOCKING
+finding for live deployment; see Part 2 for full detail.
 
 ---
 
@@ -198,3 +204,175 @@ This spike is **BLOCKED** pending owner re-planning of the CDX query strategy (b
 owner review §4's candidate (`matchType=exact` + server-side collapse) alongside the two open questions in
 §6 (the `www.`/apex identity, and whether losing subdomain-path history is acceptable) before Tasks 2–11
 proceed. GSB (objective 2, §5) can proceed independently and does not need to wait on this decision.
+
+---
+
+## Part 2 — Safe Browsing + live end-to-end confirmation (2026-07-19)
+
+**Context:** Phase 5b's code is complete and reviewed (282 tests pass, 3 skipped, confirmed again at
+the end of this session with no regressions). `.env` now has a `GOOGLE_SAFE_BROWSING_API_KEY`. This
+session exercises the assembled system against real APIs — Safe Browsing (never run before this
+session) and a live end-to-end pass over `toxicity.screen()` against real Wayback CDX data.
+
+> **BLOCKING FINDING — Safe Browsing API access is non-functional for the configured key.**
+> Every real call to `threatMatches:find` this session returned **HTTP 403**, not a successful
+> response. Two different real error bodies were observed across four raw attempts (spaced ~2
+> minutes apart, to rule out enablement-propagation lag per Google's own suggestion in the error
+> text):
+> - `reason: API_KEY_SERVICE_BLOCKED` — "Requests to this API ... are blocked" (an API restriction
+>   on the key itself excludes Safe Browsing), and
+> - `reason: SERVICE_DISABLED` — "Safe Browsing API has not been used in project ... or it is
+>   disabled. Enable it by visiting
+>   `https://console.developers.google.com/apis/api/safebrowsing.googleapis.com/overview?project=<redacted>`
+>   ..."
+>
+> The key format itself is well-formed (39 chars, `AIza` prefix, no stray whitespace/quoting from
+> `.env` parsing) — this is **not** a key-typo or `load_dotenv()` bug. It is a **Google Cloud Console
+> configuration problem on the owner's project**: the Safe Browsing API needs to be enabled for the
+> project backing this key (and/or the key's API-restriction allowlist needs Safe Browsing added).
+> This is outside what a coding session can fix — it needs the owner to act in Cloud Console. No
+> project number or the key itself is recorded here beyond what Google's own error text already
+> names; the key was never printed at any point in this session.
+>
+> **Consequence:** every domain screened this session had its GSB leg fail, so every live end-to-end
+> verdict was pulled to `unknown_error` (see Part 2's precedence note under B2 below) rather than
+> whatever it would otherwise have been. **This degrades safely** — `unknown_error` is never `pass`,
+> so nothing this session risked a live domain silently clearing the hard-reject gate — but it also
+> means the gate is **not currently functional** for its actual purpose, and Objective 2 (A1–A4)
+> could not be completed against real successful GSB responses.
+
+### Part A — Safe Browsing spike results
+
+**A1 (clean-batch shape) and A2 (match shape): BLOCKED.** Both raw calls (ordinary domains for A1;
+Google's official test URL `http://malware.testing.google.test/testing/malware/` for A2) returned
+403 as described above, not a `{}` or a `matches` payload. No genuine clean-batch or match-shape
+response was ever received.
+
+**A3 (URL echo format — the highest-risk check): UNTESTABLE this session, NOT confirmed either
+way.** `GsbClient.check(["malware.testing.google.test"])` was run against the real endpoint; it
+raised (folded into `unknown_error`, same as every other domain) because the underlying `_find` call
+403'd. **The specific question — whether Google echoes `threat.url` in a form containing `//<domain>/`
+so `GsbClient._find`'s substring match actually fires — remains OPEN.** This is distinct from, and
+does **not** resolve, the code's existing assumption; it simply could not be exercised against real
+data this session. It must be re-verified (rerun this exact A2/A3 pair) the moment the API access
+issue above is fixed, **before** relying on GSB's hard-reject leg in production.
+
+**A4 (empty-`platformTypes` guard):** Not exercised against a live response for the same reason —
+there was no successful response to compare against. The pre-send guard in `GsbClient._find` (refusing
+to send when any of `threatTypes`/`platformTypes`/`threatEntryTypes` is empty) is unit-tested and was
+not touched; this session adds no new live evidence for or against it.
+
+**A5 (fixtures):** `tests/fixtures/gsb_empty.json` / `gsb_match.json` were **NOT created**. The
+instruction was to save them from the *real* A1/A2 responses; no real success response exists to save
+without fabricating one, which would misrepresent verified data as observed. Left absent, exactly as
+Part 1 left them, but now for a different, more specific reason (API access blocked, not "key absent").
+
+### Part B — Live end-to-end confirmation
+
+All CDX calls went through the real `toxicity.CdxClient` against `https://web.archive.org/cdx/search/cdx`
+via `domainscout.ingest.make_client()`. Because GSB is blocked (above), several checks below use a
+**stub `GsbClient`** that simulates a *working* GSB returning "not listed" — this is called out
+explicitly at each use; it isolates the real, unmodified CDX/`decide()` logic against real Wayback
+data so the invariants could still be checked honestly, without faking GSB's own behavior or silently
+patching production code.
+
+**B1 — `cnn.com` (long-lived domain).** `python -m domainscout screen --domain cnn.com --json`
+(real GSB, which 403'd) produced a fully populated `HistoryShape`: lifetime span **26.03 years**
+(2000-06-20 → 2026-07-01), 311 monthly-sampled captures, `digest_churn=0.637`, `status_mix`
+`{2xx: 189, 3xx: 106, other: 16}`. A tail block **was** produced (24 captures, 2024-08 → 2026-07,
+span 1.91y) with a real divergence: `churn_ratio=0.589`, `status_shift=-0.274`,
+`mime_shift=-0.361`, `captures_per_year_ratio=1.05`. Numbers land close to Part 1's `exact-collapse`
+measurement (311 rows), as expected — same query strategy, one day later. Verdict was `unknown_error`
+(GSB leg failed), not a reflection of the CDX leg, which succeeded cleanly.
+**Verdict: PASS — HistoryShape mechanics work correctly against real, heavily-crawled data.**
+
+**B2 — `qzxkvbnmplkjhgfd.com` (never-archived name).** Two runs, for the reason above:
+- **Real, unmodified CLI** (`--no-cache`, real GSB): returned `verdict=unknown_error`, `history=null`.
+  This is because `decide()`'s precedence puts `errors` ahead of `shape is None` — a GSB failure masks
+  what would otherwise be `unknown_no_history`. This is the *actual* current behavior of the deployed
+  system while the GSB key is broken.
+- **Stub-GSB isolation** (real `CdxClient` against real archive.org, GSB replaced with a stub that
+  returns "not listed" for everything, i.e. what a *working* GSB would return for this domain):
+  `verdict=unknown_no_history`, `reason="no wayback captures - absence of evidence, not evidence of
+  anything"`, `history=None`.
+**Verdict: the ratified invariant HOLDS in the code — confirmed against real Wayback data, with GSB
+neutralized because it cannot currently succeed for real.** It is **not yet confirmed** through the
+literal unmodified end-to-end path, because that path cannot currently produce anything but
+`unknown_error` for *any* domain until the Part-A blocker is fixed. Either way, the specific failure
+mode the brief worried about (a never-archived name silently reading as `pass`) **did not occur** in
+any run this session.
+
+**B3 — cache hit fidelity.** Ran with real `CdxClient` (instrumented with a call-counter, not just
+timing) + stub GSB (so the verdict is cacheable — a real GSB failure produces `unknown_error`, which
+`VerdictCache.put` never persists by design, so the cache-hit path would otherwise be unreachable
+right now):
+- **RUN1 (miss):** 28.53 s elapsed, `cdx.fetch` called once (two real GETs inside it), `verdict=pass`.
+- **RUN2 (hit, fresh `VerdictCache` object reloaded from disk):** **0.0 s** elapsed, `cdx.fetch`
+  called **zero** times.
+- `history` JSON blocks: **identical** between the two runs. `gsb_currently_listed`: **identical**
+  (`false`/`false`). `history` on the hit run is **non-null**, populated exactly as on the miss.
+**Verdict: PASS — the final-review cache-hit-fidelity fix holds under real data; no regression.**
+
+**B4 — apex/www question.** Scanned live HTTP redirect behavior first to find genuinely diverging
+pairs (`python.org` apex 301→www, `www.python.org` 200; similar asymmetric patterns confirmed for
+7 more modern domains). Then queried real CDX for apex vs. `www.` on **15 real domains total this
+session** (`python.org`, `stackoverflow.com`, `npmjs.com`, `wordpress.com`, `medium.com`, `eff.org`,
+`archive.org`, `github.com`, plus the 6 defunct-dotcom domains from Part 1's flip-scan re-tested here:
+`webvan.com`, `kozmo.com`, `boo.com`, `flooz.com`, `theglobe.com`, `pseudo.com`) — **every single one**
+returned **byte-identical** `(timestamp, digest)` series for apex vs. `www.`, matching Part 1's
+`cnn.com` "surprise" (§6.1). Combined with `cnn.com`, that is **16/16 real domains with zero observed
+apex/www divergence** under `matchType=exact` + server-side collapse. **This resolves Part 1's open
+question #6:** archive.org's CDX appears to canonicalize `www.`/apex to the same record for `exact`
+match, at least for every domain tested across two sessions — this is not a coincidence specific to
+`cnn.com`. **Practical implication:** `CdxClient`'s two-GET-per-domain merge has not, in 16 real
+domains, actually merged two *different* series — every "merge" so far has deduped down to exactly
+the single-host row count. `python.org` **did** show a real `2xx`/`3xx` mixture (219/69/26 in
+lifetime, 18/6 in tail) — but since apex and `www.` were identical, this mixture is **intrinsic to
+one canonical series** (the archive genuinely recorded the same URL as both a 200 and a 301 at
+different crawl times), **not** the two-host alternation contamination the code comments describe.
+**No case of the specifically-described contamination mechanism was observed.** This doesn't prove it
+can't happen — 16 domains is not exhaustive, and the code's defensive two-GET design is cheap
+insurance — but the originally-suspected failure mode did not materialize in any real sample.
+
+**B5 — cp1252 / scheduled-task path.** `PYTHONIOENCODING=cp1252 python -m domainscout screen
+--domain python.org --no-cache > out.txt 2>&1` (non-`--json`, full human-readable output, real GSB
+403 included) → **exit code 0**, no `UnicodeEncodeError`, no traceback. Confirmed structurally too:
+both `domainscout/toxicity.py` and `domainscout/commands.py` are 100% ASCII source (checked
+programmatically), which is exactly why this passes.
+**Verdict: PASS — no encoding regression found.**
+
+**B6 — CDX request counts / latency / errors, this session.** Roughly 44 real CDX GET requests
+across B1–B4's domains (raw counts, not amplified — `CdxClient.fetch` issues 2 GETs/domain; the B4
+per-host scans issued 2 more each). **Zero 429s, zero 5xx** observed, consistent with Part 1's "not
+yet hit, not confirmed absent." Latency ranged from **~0.5 s** (never-archived domains, and low-traffic
+apex/www pairs like `npmjs.com`) up to **16.15 s** for a clean single-shot GET (`www.wordpress.com`,
+re-measured directly to isolate from retry logic) — and **36.2 s** for the *wrapped* (`CdxClient._get`,
+which includes automatic retry+backoff) call to the same host, which is higher than any single-shot
+figure measured on the same domain moments later (14.5 s / 16.2 s apex/www). This is consistent with
+one attempt landing close to the configured `cdx_timeout=20.0` and triggering a retry — plausible, not
+directly captured via a timeout-event log, so recorded as an inference, not a confirmed cause. Either
+way: **the configured 20 s `cdx_timeout` sits close enough to real observed single-request latency for
+a busy modern site that an occasional retry under load would not be surprising**, which the design
+already tolerates (`cdx_max_retries=3`) but is worth having on record as measured, not assumed.
+
+### Part 2 summary
+
+| Check | Verdict |
+|---|---|
+| A1 clean-batch shape | BLOCKED — 403, no real response captured |
+| A2 match shape | BLOCKED — 403, no real response captured |
+| **A3 URL echo format (highest-risk)** | **UNTESTABLE — GSB access itself is blocked; the echo-format question is still open, not resolved either direction** |
+| A4 empty-platformTypes guard | Not exercised live (no successful response to test against) |
+| A5 fixtures | Not created — no real success data exists to save |
+| B1 long-lived domain | PASS — real HistoryShape correctly populated |
+| **B2 never-archived domain** | **Invariant holds in the code (confirmed via real-CDX + stub-GSB isolation); NOT yet confirmed via the literal unmodified live path, which currently degrades to `unknown_error` instead because of the GSB blocker — never `pass`, so no unsafe outcome occurred** |
+| B3 cache hit fidelity | PASS — miss/hit payloads agree, hit makes 0 network calls |
+| B4 apex/www question | Real mixing observed (`python.org`) is intrinsic to one series, not host-merge contamination; 16/16 real domains showed apex≡www, resolving Part 1's open question |
+| B5 cp1252 path | PASS — exit 0, no UnicodeEncodeError |
+| B6 CDX limits | 0 429/5xx across ~44 requests this session; latency 0.5–16.2 s single-shot, one 36.2 s wrapped/retry-inflated outlier |
+
+**Overall: the toxicity gate's CDX/history-shape half is confirmed working correctly against real
+data, including the cache-hit-fidelity fix. The GSB/hard-reject half cannot be confirmed at all this
+session — it needs a Google Cloud Console fix (enable the Safe Browsing API / adjust API-key
+restrictions for the project behind the current key) before A1–A4 can be completed, and A3 in
+particular must be re-run and resolved before the gate is trusted to catch a real listed domain.**
